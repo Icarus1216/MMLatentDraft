@@ -412,22 +412,128 @@ class RLDModel(nn.Module):
             CausalLMOutputWithPast
         """
         if prefix_embeds is None:
-            # 没有 prefix: 直接调用基座模型
-            outputs = self.base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
+            # 没有 prefix: 走手动拆解路径 (不直接调用 self.base_model，避免重复运行视觉 encoder)
+            # 当 forward() 中已运行过视觉 encoder 并传入 cached_visual_embeds 时，
+            # 直接调用 self.base_model 会导致视觉 encoder 被第二次调用，
+            # 可能导致 Flash Attention 中的 position_ids 不一致 → CUDA illegal memory access。
+            B = input_ids.shape[0]
+            seq_len = input_ids.shape[1]
+            
+            inner_model = self.base_model.model  # Qwen3_5Model
+            lm_head = self.base_model.lm_head
+            text_model = inner_model.language_model  # Qwen3_5TextModel
+            
+            # Step 1: Embedding
+            inputs_embeds = inner_model.get_input_embeddings()(input_ids)
+            
+            # Step 2: 视觉融合 (优先使用缓存)
+            if cached_visual_embeds is not None:
+                image_token_id = inner_model.config.image_token_id
+                image_mask = (input_ids == image_token_id)
+                num_image_tokens = image_mask.sum().item()
+                if num_image_tokens > 0:
+                    image_embeds = cached_visual_embeds[:num_image_tokens].to(
+                        inputs_embeds.device, inputs_embeds.dtype
+                    )
+                    image_mask_3d = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
+                    inputs_embeds = inputs_embeds.masked_scatter(image_mask_3d, image_embeds)
+            elif pixel_values is not None:
+                _pixel_values = pixel_values.to(dtype=inner_model.visual.dtype)
+                vision_output = inner_model.visual(
+                    _pixel_values, grid_thw=image_grid_thw
+                )
+                merged_hidden_states = _extract_visual_output(vision_output)
+                split_sizes = (
+                    image_grid_thw.prod(-1) // inner_model.visual.spatial_merge_size ** 2
+                ).tolist()
+                image_embeds = list(torch.split(merged_hidden_states, split_sizes))
+                image_embeds = torch.cat(image_embeds, dim=0).to(
+                    inputs_embeds.device, inputs_embeds.dtype
+                )
+                image_mask, _ = inner_model.get_placeholder_mask(
+                    input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            
+            # Step 2.5: 初始化 cache
+            if past_key_values is None:
+                try:
+                    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+                    cache = Qwen3_5DynamicCache(config=text_model.config)
+                except (ImportError, AttributeError):
+                    from transformers.cache_utils import DynamicCache
+                    cache = DynamicCache()
+            else:
+                cache = past_key_values
+            past_seen = self._get_full_attn_cache_len(cache)
+            
+            # Step 3: 位置编码 (无 prefix，不需要扩展)
+            has_image = pixel_values is not None and image_grid_thw is not None
+            seg_token_mask = torch.ones(B, seq_len, device=input_ids.device, dtype=torch.long)
+            image_token_id_for_rope = inner_model.config.image_token_id
+            mm_token_type_ids = torch.zeros(B, seq_len, device=input_ids.device, dtype=torch.int)
+            if has_image:
+                mm_token_type_ids[input_ids == image_token_id_for_rope] = 1
+            
+            inner_model.rope_deltas = None
+            position_ids_computed, rope_deltas = inner_model.get_rope_index(
+                input_ids,
+                mm_token_type_ids=mm_token_type_ids,
+                image_grid_thw=image_grid_thw if has_image else None,
+                video_grid_thw=None,
+                attention_mask=seg_token_mask,
             )
+            inner_model.rope_deltas = rope_deltas
+            
+            # 构造 [4, B, seq_len]: text_position_ids + mRoPE 3 维
+            if position_ids_computed is not None and position_ids_computed.dim() == 3:
+                text_pos = torch.arange(
+                    past_seen, past_seen + seq_len, device=position_ids_computed.device
+                ).unsqueeze(0).expand(B, -1)  # [B, seq_len]
+                position_ids_computed = torch.cat(
+                    [text_pos.unsqueeze(0), position_ids_computed], dim=0
+                )  # [4, B, seq_len]
+            
+            # Step 4: cache_position
+            cache_position = torch.arange(
+                past_seen, past_seen + seq_len, device=inputs_embeds.device
+            )
+            
+            # Step 5: 调用 text model
+            text_outputs = text_model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids_computed,
+                past_key_values=cache,
+                cache_position=cache_position,
+                use_cache=True,
+            )
+            
+            hidden_states = text_outputs.last_hidden_state
+            logits = lm_head(hidden_states)
+            
+            # 计算 loss (如果需要)
+            loss = None
+            if labels is not None:
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                )
+            
+            # 提取 mRoPE 最后位置
+            mrope_last_pos = None
+            if position_ids_computed is not None and position_ids_computed.dim() == 3 and position_ids_computed.shape[0] == 4:
+                mrope_last_pos = position_ids_computed[1:, :, -1:]  # [3, B, 1]
+            
             return {
-                'loss': outputs.loss,
-                'logits': outputs.logits,
-                'past_key_values': outputs.past_key_values,
-                'hidden_states': None,
-                'mrope_last_pos': None,
+                'loss': loss,
+                'logits': logits,
+                'past_key_values': text_outputs.past_key_values,
+                'hidden_states': hidden_states,
+                'mrope_last_pos': mrope_last_pos,
             }
 
         # ====== 有 prefix embedding 注入 ======
