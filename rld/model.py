@@ -1168,6 +1168,15 @@ class RLDModel(nn.Module):
         main_loss = total_loss.detach()
         total_loss = total_loss + div_loss
 
+        # 安全保护: NaN/Inf loss 会导致 backward 挂起 → 某些 rank hang → NCCL 超时
+        # 用 0 替代异常 loss，使 backward 仍能正常完成梯度同步
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            _rank = int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
+            print(f"[RLD rank={_rank}] ⚠️ loss 为 NaN/Inf (total={total_loss.item()}, "
+                  f"main={main_loss.item()}, div={div_loss.item()})，"
+                  f"替换为 0 以避免 backward hang")
+            total_loss = torch.tensor(0.0, device=device, dtype=ctrl_dtype, requires_grad=True)
+
         # 调试日志: 段循环总结
         if _rld_debug and _rank == 0:
             _is_nan = torch.isnan(total_loss).item()
