@@ -1,0 +1,99 @@
+# RLD (Reflective Latent Draft) 训练配置
+# 面向 Qwen3.5 的步级"回看-验证"隐空间草稿
+#
+# 核心设计:
+#   - 冻结 Qwen3.5 全部参数
+#   - 只训练 RLD Controller (< 20M 参数)
+#   - 通过 prefix embedding 注入影响自回归生成 (每段一次 forward)
+#   - 在 </step> 边界触发 "回看-验证" 更新
+#
+# 4B Dense 优化 (去除 30B MoE 时代的显存妥协):
+#   - hidden_states 不 detach: controller 获得双重梯度路径
+#   - 段1+ 合并双重 forward 为单次: forward 次数 N 段 = N 次
+#   - 移除 dummy 段对齐: ZeRO-2 不需要
+#   - EmbeddingProjector 全秩投影: 参数量仅增 ~1M
+
+# 基座模型配置
+model:
+  model_path: "/mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/Qwen_Qwen3.5-4B"
+  hidden_size: 2560          # Qwen3.5-4B 隐藏维度 (稠密模型)
+  total_layers: 32           # Qwen3.5-4B decoder 总层数 (config.json: num_hidden_layers=32)
+  torch_dtype: "bfloat16"
+  attn_implementation: "flash_attention_2"
+
+# RLD Controller 配置
+rld:
+  # 维度配置
+  d_z: 512                   # controller 空间维度 (独立于 KV 空间, 保持紧凑)
+  
+  # 槽位配置
+  num_evidence_slots: 16     # 冻结视觉证据槽 K_e
+  num_draft_slots: 16        # 可擦写草稿槽 K_d
+  num_trace_slots: 16        # 推理轨迹槽 K_t
+  
+  # KV 注入配置
+  # (当前使用方案 A: Embedding 注入, prefix embedding 自然参与全层 attention)
+  
+  # 正则化
+  lambda_div: 0.01           # 多样性正则化权重 (防止草稿槽坍塌)
+
+# 数据配置
+data:
+  # 训练数据: JSON 格式
+  # 每个样本: {"image": path, "question": text, "answer": text}
+  # answer 中可以包含 </step> 作为步骤分隔符
+  train_json: "/mnt/cephszjt/user_juntianzhang/LatentDraft/data/rld_mmathcot_filtered_checked.json"
+  # eval_json: "/path/to/your/rld_val.json"   # 可选，暂未配置
+  
+  # 自动分步: 对于无 </step> 标注的数据，按句号/换行自动分段
+  auto_split_steps: true
+  
+  # 跳过图片存在性检查: 数据已通过 scripts/prefilter_data.py 预过滤时设为 true
+  # 可节省每次训练启动时 ~4 分钟的 IO 检查时间 (297K 样本 × 8 进程)
+  skip_image_check: true
+  
+  # 序列最大长度: 超过此长度的样本会被截断 (防止极长样本导致 NCCL 超时)
+  max_seq_len: 4096
+  
+  # System Prompt: 在对话中注入分步推理指令
+  # 训练和推理时统一使用，引导 Qwen3.5 自主按 </step> 分步输出思维链
+  use_system_prompt: true
+  # system_prompt: null  # 使用默认 RLD_SYSTEM_PROMPT; 也可自定义字符串
+
+# 训练配置
+training:
+  output_dir: "./outputs/rld_train"
+  
+  # 训练参数
+  num_epochs: 1
+  per_device_train_batch_size: 2     # Qwen3.5-4B 稠密模型显存压力小，可增大 batch size
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 8     # 有效 batch_size = 2 * 8 * num_gpus
+  
+  # 学习率
+  learning_rate: 1.0e-4              # 全局学习率 (TrainingArguments 需要)
+  controller_lr: 1.0e-4              # RLD Controller 学习率
+  weight_decay: 0.01
+  warmup_steps: 100
+  max_grad_norm: 1.0
+  
+  # 日志
+  logging_steps: 20
+  monitor_every_n_steps: 50
+  
+  # 保存
+  save_steps: 500
+  save_total_limit: 3
+  eval_steps: 500
+  
+  # 数据加载
+  num_workers: 4
+  
+  # DeepSpeed ZeRO-2: 4B 稠密模型无需 ZeRO-3，ZeRO-2 更高效
+  deepspeed_config: "configs/ds_config_zero2.json"
+  
+  # 报告
+  report_to: ["tensorboard"]
+
+# 随机种子
+seed: 42

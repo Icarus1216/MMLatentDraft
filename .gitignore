@@ -1,0 +1,41 @@
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 大型数据集目录（通过 HuggingFace 等渠道单独下载）
+data/MMathCoT-1M/
+data/SPAR-7M/
+data/ViRL39K/
+data/clevr-math/
+
+# 大型 JSON 数据文件（>100MB）
+data/rld_mmathcot_filtered.json
+data/rld_mmathcot_filtered_checked.json
+
+# 训练输出
+outputs/
+
+# 模型权重文件（如果有）
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# 系统文件
+.DS_Store
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+
+# 日志
+*.log
+wandb/
