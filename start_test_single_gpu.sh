@@ -30,6 +30,12 @@ echo "GPU 数量: $GPU_COUNT"
 export CUDA_VISIBLE_DEVICES=0
 export RLD_DEBUG=1                # 开启 RLD 段循环调试日志
 
+# 注意力实现切换 (flash_attention_2 / sdpa / eager)
+# sdpa: 兼容性好，适合调试 (默认)
+# flash_attention_2: 最快，正式训练推荐 (需要环境支持)
+# eager: 最慢但兼容性最好，用于排查问题
+export RLD_ATTN_IMPL=${RLD_ATTN_IMPL:-sdpa}
+
 # 可选: 开启 CUDA 同步模式 (更慢但错误定位更精确)
 # export CUDA_LAUNCH_BLOCKING=1
 

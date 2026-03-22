@@ -44,6 +44,13 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1  # 使用新版变量名
 export TORCH_NCCL_TRACE_BUFFER_SIZE=1000  # 启用 FlightRecorder 便于调试
 export NCCL_DEBUG=WARN             # NCCL 日志级别
 
+# 注意力实现切换 (flash_attention_2 / sdpa / eager)
+# 正式训练默认使用 flash_attention_2 (最快)
+# 如果 flash-attn 环境有问题，可临时切换:
+#   export RLD_ATTN_IMPL=sdpa bash start_training.sh
+# 或取消下面这行的注释:
+# export RLD_ATTN_IMPL=sdpa
+
 # 创建输出目录
 mkdir -p outputs/rld_train
 

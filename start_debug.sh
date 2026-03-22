@@ -36,6 +36,10 @@ export TORCH_NCCL_TRACE_BUFFER_SIZE=1000
 export NCCL_DEBUG=INFO            # 更详细的 NCCL 日志
 export RLD_DEBUG=1                # 开启 RLD 段循环调试日志
 
+# 注意力实现切换 (flash_attention_2 / sdpa / eager)
+# 调试模式默认使用 sdpa (兼容性好)，正式训练切换为 flash_attention_2
+export RLD_ATTN_IMPL=${RLD_ATTN_IMPL:-sdpa}
+
 # 可选: 开启 CUDA 同步模式 (更慢但错误定位更精确)
 # export CUDA_LAUNCH_BLOCKING=1
 

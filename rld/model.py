@@ -136,9 +136,20 @@ class RLDModel(nn.Module):
         self.total_layers = total_layers
         self._verbose = _is_main_process()
 
+        # ====== 注意力实现: 支持通过环境变量 RLD_ATTN_IMPL 动态切换 ======
+        # 优先级: 环境变量 > 调用方传入的参数 > 默认值 (flash_attention_2)
+        # 可选值: flash_attention_2 / sdpa / eager
+        env_attn = os.environ.get('RLD_ATTN_IMPL', None)
+        if env_attn is not None and env_attn != attn_implementation:
+            if self._verbose:
+                print(f"[RLD] ⚠️  注意力实现: {attn_implementation} → {env_attn} (通过 RLD_ATTN_IMPL 环境变量覆盖)")
+            attn_implementation = env_attn
+        self.attn_implementation = attn_implementation
+
         # ====== 1. 加载并冻结 Qwen3.5 ======
         if self._verbose:
             print(f"[RLD] 加载 Qwen3.5: {model_path}")
+            print(f"[RLD] 注意力实现: {attn_implementation}")
 
         self.base_model = Qwen3_5ForConditionalGeneration.from_pretrained(
             model_path,
