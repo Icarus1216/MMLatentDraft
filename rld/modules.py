@@ -20,7 +20,7 @@ from typing import Optional, Tuple
 
 
 class RMSNorm(nn.Module):
-    """RMSNorm，与 Qwen3.5 内部使用的归一化方式一致"""
+    """RMSNorm，与 Qwen3-VL 内部使用的归一化方式一致"""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -141,7 +141,7 @@ class EvidenceResampler(nn.Module):
     采用 Perceiver/Flamingo 风格的 learnable queries cross-attention。
     
     Args:
-        hidden_size: 基座模型隐藏维度 (2560 for Qwen3.5-4B)
+        hidden_size: 基座模型隐藏维度 (4096 for Qwen3-VL-8B)
         d_z: controller 空间维度 (512)
         num_evidence_slots: 证据槽数量 K_e (默认 16)
         num_heads: cross-attention 头数
@@ -150,7 +150,7 @@ class EvidenceResampler(nn.Module):
 
     def __init__(
         self,
-hidden_size: int = 2560,
+hidden_size: int = 4096,
         d_z: int = 512,
         num_evidence_slots: int = 16,
         num_heads: int = 8,
@@ -206,7 +206,7 @@ class StepResampler(nn.Module):
     压缩为固定长度摘要 S_c ∈ R^{K_t × d_z}
     
     Args:
-        hidden_size: 基座模型隐藏维度 (2560)
+        hidden_size: 基座模型隐藏维度 (4096)
         d_z: controller 空间维度 (512)
         num_trace_slots: 轨迹槽数量 K_t (默认 16)
         num_heads: cross-attention 头数
@@ -214,7 +214,7 @@ class StepResampler(nn.Module):
 
     def __init__(
         self,
-hidden_size: int = 2560,
+hidden_size: int = 4096,
         d_z: int = 512,
         num_trace_slots: int = 16,
         num_heads: int = 8,
@@ -584,19 +584,19 @@ class EmbeddingProjector(nn.Module):
     2. 实现简洁: 无需 hook、无需手动展开 decoder 层
     3. 兼容性好: 与 flash attention / mRoPE 天然兼容
     
-    4B Dense 优化: 使用全秩投影 (不再低秩分解)
+    使用全秩投影 (不低秩分解)
       prefix_embeds = RMSNorm(MLP(Z_p))
-      MLP: d_z → hidden_size (直接投影, 参数量仅 ~1.3M)
+      MLP: d_z → hidden_size (直接投影, 参数量约 ~2.1M)
     
     Args:
         d_z: controller 空间维度 (512)
-        hidden_size: 基座模型隐藏维度 (2560 for Qwen3.5-4B)
+        hidden_size: 基座模型隐藏维度 (4096 for Qwen3-VL-8B)
     """
 
     def __init__(
         self,
         d_z: int = 512,
-        hidden_size: int = 2560,
+        hidden_size: int = 4096,
     ):
         super().__init__()
         self.d_z = d_z

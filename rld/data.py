@@ -1,7 +1,7 @@
 """
-RLD 数据处理 (方案 B: Qwen3.5 适配)
+RLD 数据处理 (适配 Qwen3-VL-8B-Instruct)
 
-Dataset: 加载图像+问答数据，利用 Qwen3.5 原生 <think></think> 格式
+Dataset: 加载图像+问答数据，利用 Qwen3-VL 原生 <think></think> 格式
          在 <think> 块内部使用 </step> 做细粒度分步控制 RLD 更新
          支持三种 think 块来源 (由 pregenerate_think.py 三阶段流水线生成):
            1. free_reasoning: 自由推理正确 (最高质量, 分布最匹配)
@@ -32,8 +32,8 @@ except ImportError:
     process_vision_info = None
 
 
-# ====== RLD System Prompt (方案 B: Qwen3.5 格式) ======
-# Qwen3.5 的 thinking 模式是内建的 — chat_template 的 add_generation_prompt
+# ====== RLD System Prompt (Qwen3-VL 格式) ======
+# Qwen3-VL 的 thinking 模式是内建的 — chat_template 的 add_generation_prompt
 # 会自动输出 `<|im_start|>assistant\n<think>\n`，模型已被训练为在 <think> 内思考。
 # 因此 system prompt 不需要教模型 <think>/<\think> 格式（冗余且可能冲突），
 # 只需要教 RLD 自定义的 </step> 分步规范。
@@ -44,7 +44,7 @@ For each distinct observation, calculation, or deduction, end that step with </s
 
 class RLDDataset(Dataset):
     """
-    RLD 数据集 (方案 B: Qwen3.5 适配)
+    RLD 数据集 (Qwen3-VL 适配)
     
     训练数据格式 (基本): 图像 + query + answer
     ```json
@@ -70,7 +70,7 @@ class RLDDataset(Dataset):
       1. 数据中的 "think_chain" 字段 (由 pregenerate_think.py 用 vLLM 预生成)
       2. 伪造: 用 answer 碎片自动构造占位 think 块 (fallback)
     
-    训练时的序列构造 (符合 Qwen3.5 官方 chat_template):
+    训练时的序列构造 (符合 Qwen3-VL 官方 chat_template):
       [prompt]<|im_start|>assistant\n<think>\n{steps}\n</step>\n</think>\n\n{answer}<|im_end|>
       其中 `<|im_start|>assistant\n<think>\n` 由 apply_chat_template(add_generation_prompt=True) 自动生成,
       think_block 只包含 think 内部内容 (不含 <think>/</think> 标签),
@@ -157,12 +157,12 @@ class RLDDataset(Dataset):
         if self.processor.tokenizer.pad_token_id is None:
             self.processor.tokenizer.pad_token_id = self.processor.tokenizer.eos_token_id
 
-        # Qwen3.5 的 image placeholder token id (从 processor 配置获取)
-        # Qwen3.5: 248056, Qwen3-VL: 151655
+        # Qwen3-VL 的 image placeholder token id (从 processor 配置获取)
+        # Qwen3-VL: 151655
         try:
             self.IMAGE_TOKEN_ID = self.processor.image_token_id
         except AttributeError:
-            self.IMAGE_TOKEN_ID = 248056  # Qwen3.5 默认值
+            self.IMAGE_TOKEN_ID = 151655  # Qwen3-VL 默认值
 
         # 高质量来源: think 块参与 loss
         self.SUPERVISED_THINK_SOURCES = {"free_reasoning", "corrected_free_reasoning", "dataset_converted"}
@@ -181,7 +181,7 @@ class RLDDataset(Dataset):
         self.pregenerated_ratio = num_pregenerated / max(len(self.data), 1)
 
         print(f"[RLDDataset] 加载 {len(self.data)} 个样本 from {json_path}")
-        print(f"[RLDDataset] 方案 B: Qwen3.5 格式, 分段监督 labels")
+        print(f"[RLDDataset] Qwen3-VL 格式, 分段监督 labels")
         print(f"[RLDDataset] 预生成推理链覆盖率: {num_pregenerated}/{len(self.data)} "
               f"({self.pregenerated_ratio:.1%})")
         if source_counts:
@@ -396,7 +396,7 @@ class RLDDataset(Dataset):
         # 完整回答部分 (拼接在 generation prompt 之后):
         # generation prompt 已输出: `<|im_start|>assistant\n<think>\n`
         # 我们拼接: {think_inner}</think>\n\n{final_answer}<|im_end|>
-        # 其中 </think>\n\n 符合 Qwen3.5 官方模板格式
+        # 其中 </think>\n\n 符合 Qwen3-VL 官方模板格式
         im_end_token = "<|im_end|>"
         
         # 分别 tokenize think 内部内容 + </think>\n\n 过渡 和 final answer，以便精确设置 labels
@@ -488,7 +488,7 @@ class RLDDataset(Dataset):
         # 截断后如果 image token 数量与 visual features 不一致，说明截断保护失效。
         # 此时不能清除 pixel_values (会导致 ZeRO-3 下 ViT forward 路径不一致 → NCCL 死锁)。
         # 安全做法: 完全不截断该样本 (恢复原始序列)，容忍可能的 OOM。
-        SPATIAL_MERGE_SIZE = 2   # Qwen3.5 默认 spatial_merge_size
+        SPATIAL_MERGE_SIZE = 2   # Qwen3-VL 默认 spatial_merge_size
         if pixel_values is not None and image_grid_thw is not None:
             num_image_tokens = (input_ids == self.IMAGE_TOKEN_ID).sum().item()
             num_image_features = (

@@ -1,33 +1,31 @@
-"""RLD Model: 包装 Qwen3.5 VLM 的 Reflective Latent Draft 模型
+"""RLD Model: 包装 Qwen3-VL VLM 的 Reflective Latent Draft 模型
 
-方案 B: Qwen3.5 适配
-- 基模采用 Qwen3.5-4B (稠密模型, 混合 linear_attention + full_attention)
-- 训练数据中没有思维链，只有最终答案作为监督信号
+基座模型: Qwen3-VL-8B-Instruct (标准 full_attention + DeepStack 视觉注入)
 - 在 <think> 块内部使用 </step> 做细粒度分步控制 RLD 更新
 - Loss 来源采用分段监督: 高质量推理链 (free_reasoning/corrected) 的 think 块参与 loss,
   伪造/低质量的 think 块 labels=-100; final answer 始终参与 loss
 - 梯度通过 KV cache 从 final answer 回传穿过所有段的 RLD Controller
 
 核心设计:
-1. 冻结 Qwen3.5 全部参数
-2. 只训练 RLD Controller 的外挂模块 (< 20M 参数)
+1. 冻结 Qwen3-VL 全部参数
+2. 只训练 RLD Controller 的外挂模块 (< 25M 参数)
 3. 通过 Embedding 注入影响后续自回归生成，梯度自然连通
 4. 训练时按 step 段展开，每个 token 只 forward 一次
 5. 每段只做一次 text_model.forward (prefix + seg 合并), 总计 N 段 = N 次 forward
 
 关键约束:
-- 不对 Qwen3.5 重复 forward
+- 不对 Qwen3-VL 重复 forward
 - 兼容原生推理过程 (flash attention / mRoPE)
-- Qwen3.5 无 DeepStack，视觉编码器返回 BaseModelOutputWithPooling
+- Qwen3-VL 有 DeepStack，视觉编码器返回 (hidden_states, deepstack_features)
 - prefix embedding 参与完整 Transformer forward，CE Loss 梯度直达所有 controller 组件
 - 训推一致: 训练和推理都使用 <think>...</think> + </step> 格式
 
-4B Dense 优化 (去除 30B MoE 时代的显存妥协):
-- 移除 hidden_states detach: controller 获得双重梯度路径 (rld_state 链 + hidden 直接梯度)
-- 移除 dummy 段对齐: ZeRO-2 不需要段数对齐, 按实际段数循环
-- 段1+ 合并双重 forward: 不再分 _differentiable_update_prefix_kv + skip_prefix 两步,
-  统一走 skip_prefix=False 一次 forward [prefix | seg], forward 次数 N段=N次
-- EmbeddingProjector 去低秩化: 全秩投影, 提升表达力
+与 Qwen3.5-4B 版本的主要差异:
+- 标准 full_attention (无 linear_attention 混合层), KV cache 为标准 DynamicCache
+- 有 DeepStack 视觉特征注入 (在 decoder 前几层注入多层视觉特征)
+- hidden_size: 4096 (而非 2560)
+- num_hidden_layers: 36 (而非 32)
+- 无需特殊处理 conv_states / recurrent_states
 """
 import os
 import math
@@ -37,29 +35,33 @@ import torch.nn.functional as F
 from typing import Optional, List, Dict, Tuple, Union
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-# Qwen3.5 版本: 使用 Qwen3_5ForConditionalGeneration
-from transformers import Qwen3_5ForConditionalGeneration, AutoProcessor
+# Qwen3-VL 版本: 使用 Qwen3VLForConditionalGeneration
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
 from .controller import RLDController
 
 
 def _extract_visual_output(vision_output):
-    """从视觉编码器输出中提取 pooler_output。
+    """从视觉编码器输出中提取 merged_hidden_states 和 deepstack_features。
     
-    Qwen3.5 的 VisionModel 返回 BaseModelOutputWithPooling，
-    无 deepstack_features (deepstack_visual_indexes 为空)。
+    Qwen3-VL 的 VisionModel 返回 (hidden_states, deepstack_feature_lists):
+    - hidden_states: 经过 PatchMerger 后的视觉 token [total_visual_tokens, out_hidden_size]
+    - deepstack_feature_lists: list of Tensor, 各层 DeepStack 特征
     
     兼容两种返回格式:
-    - 对象模式 (正常): vision_output.pooler_output
-    - tuple 模式 (DeepSpeed ZeRO-3): vision_output[0] 是 pooler_output
+    - tuple 模式 (正常): vision_output = (hidden_states, deepstack_features)
+    - 单个 tensor 模式 (fallback): 直接返回
     """
-    if hasattr(vision_output, 'pooler_output'):
-        pooler_output = vision_output.pooler_output
+    if isinstance(vision_output, (tuple, list)) and len(vision_output) == 2:
+        hidden_states = vision_output[0]
+        deepstack_features = vision_output[1]
     elif isinstance(vision_output, (tuple, list)):
-        pooler_output = vision_output[0]
+        hidden_states = vision_output[0]
+        deepstack_features = None
     else:
-        pooler_output = vision_output
-    return pooler_output
+        hidden_states = vision_output
+        deepstack_features = None
+    return hidden_states, deepstack_features
 
 
 def _is_main_process():
@@ -73,13 +75,13 @@ def _is_main_process():
 
 class RLDModel(nn.Module):
     """
-    RLD Model: Qwen3.5 + Reflective Latent Draft Controller
+    RLD Model: Qwen3-VL + Reflective Latent Draft Controller
     
     架构:
     ┌──────────────────────────────────────────────────────┐
-    │  Qwen3.5 (冻结)                                          │
-    │  ├── Vision Encoder → visual tokens V                │
-    │  └── Decoder (自回归生成, 混合 linear+full attn)     │
+    │  Qwen3-VL (冻结)                                          │
+    │  ├── Vision Encoder → visual tokens V + DeepStack feats  │
+    │  └── Decoder (自回归生成, 标准 full attn + DeepStack) │
     │                                                      │
     │  RLD Controller (可训练)                               │
     │  ├── Evidence Resampler: V → Z^e (冻结证据)           │
@@ -91,24 +93,14 @@ class RLDModel(nn.Module):
     │  └── Embedding Projector: [Z_e'; Z^d] → prefix embs│
     └──────────────────────────────────────────────────────┘
     
-    训练时:
-- Qwen3.5 全部冻结
-    - 只训练 RLD Controller
-    - 按 step 段展开 (teacher forcing)
-    
-    推理时:
-    - 正常自回归生成
-    - 生成到 delimiter (</step>) 时触发 RLD 更新
-    - 重新生成 prefix embedding 并覆盖 KV cache
-    
     Args:
-        model_path: Qwen3.5 模型路径
-        hidden_size: 隐藏维度 (2560 for Qwen3.5-4B)
+        model_path: Qwen3-VL 模型路径
+        hidden_size: 隐藏维度 (4096 for Qwen3-VL-8B)
         d_z: controller 空间维度 (512)
         num_evidence_slots: 证据槽数量 (16)
         num_draft_slots: 草稿槽数量 (16)
         num_trace_slots: 轨迹槽数量 (16)
-        total_layers: 总层数 (32)
+        total_layers: 总层数 (36)
         torch_dtype: 数据类型
         attn_implementation: 注意力实现
         lambda_div: 多样性正则化权重
@@ -120,12 +112,12 @@ class RLDModel(nn.Module):
     def __init__(
         self,
         model_path: str,
-        hidden_size: int = 2560,
+        hidden_size: int = 4096,
         d_z: int = 512,
         num_evidence_slots: int = 16,
         num_draft_slots: int = 16,
         num_trace_slots: int = 16,
-        total_layers: int = 32,
+        total_layers: int = 36,
         torch_dtype: torch.dtype = torch.bfloat16,
         attn_implementation: str = "flash_attention_2",
         lambda_div: float = 0.01,
@@ -146,12 +138,12 @@ class RLDModel(nn.Module):
             attn_implementation = env_attn
         self.attn_implementation = attn_implementation
 
-        # ====== 1. 加载并冻结 Qwen3.5 ======
+        # ====== 1. 加载并冻结 Qwen3-VL ======
         if self._verbose:
-            print(f"[RLD] 加载 Qwen3.5: {model_path}")
+            print(f"[RLD] 加载 Qwen3-VL: {model_path}")
             print(f"[RLD] 注意力实现: {attn_implementation}")
 
-        self.base_model = Qwen3_5ForConditionalGeneration.from_pretrained(
+        self.base_model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_path,
             torch_dtype=torch_dtype,
             attn_implementation=attn_implementation,
@@ -163,7 +155,7 @@ class RLDModel(nn.Module):
 
         if self._verbose:
             frozen_params = sum(p.numel() for p in self.base_model.parameters())
-            print(f"[RLD] Qwen3.5 已冻结: {frozen_params / 1e9:.2f}B 参数")
+            print(f"[RLD] Qwen3-VL 已冻结: {frozen_params / 1e9:.2f}B 参数")
 
         # ====== 2. 创建 RLD Controller ======
         self.controller = RLDController(
@@ -219,28 +211,18 @@ class RLDModel(nn.Module):
                 print(f"[RLD]   使用多 token 后缀匹配模式 (共 {len(delimiter_ids)} 个 token)")
 
     def _get_full_attn_cache_len(self, past_key_values) -> int:
-        """安全获取 full_attention 层的 KV cache 序列长度
+        """安全获取 KV cache 序列长度
         
-        Qwen3.5 的 Qwen3_5DynamicCache 包含混合层类型:
-        - full_attention 层: 标准 KV cache [B, H, seq_len, D]
-        - linear_attention 层: recurrent_state (格式完全不同)
-        
-        get_seq_length() 可能返回 linear_attention 层的值 (第一层就是 linear_attention),
-        导致与 full_attention 层的实际 KV cache 长度不一致。
-        
-        此方法明确遍历到第一个 full_attention 层并返回其 KV cache 的 seq_len 维度。
+        Qwen3-VL 使用标准 full_attention，所有层的 KV cache 格式一致: [B, H, seq_len, D]
         """
         if past_key_values is None:
             return 0
         
-        text_model_layers = self.base_model.model.language_model.layers
-        for _li in range(len(text_model_layers)):
-            layer = text_model_layers[_li]
-            if layer.layer_type == "full_attention":
-                # 找到第一个 full_attention 层
-                if _li < len(past_key_values.key_cache) and past_key_values.key_cache[_li] is not None:
-                    return past_key_values.key_cache[_li].shape[2]
-                break
+        # 直接从第一个层的 KV cache 获取长度
+        if hasattr(past_key_values, 'key_cache') and len(past_key_values.key_cache) > 0:
+            kc = past_key_values.key_cache[0]
+            if kc is not None and kc.dim() == 4:
+                return kc.shape[2]
         
         # 回退: 使用默认方法
         return past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -275,11 +257,11 @@ class RLDModel(nn.Module):
         self,
         pixel_values: torch.Tensor,
         image_grid_thw: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, list]:
         """
-        从 Qwen3.5 的视觉编码器获取视觉 token 序列
+        从 Qwen3-VL 的视觉编码器获取视觉 token 序列
         
-        Qwen3.5 视觉编码器返回 BaseModelOutputWithPooling，无 deepstack_features。
+        Qwen3-VL 视觉编码器返回 (hidden_states, deepstack_feature_lists)。
         
         Args:
             pixel_values: [total_patches, channels]
@@ -287,34 +269,28 @@ class RLDModel(nn.Module):
         
         Returns:
             visual_tokens: [B, L_v, hidden_size]
+            deepstack_features: list of deepstack visual embeddings
         """
-        inner_model = self.base_model.model  # Qwen3_5Model
+        inner_model = self.base_model.model  # Qwen3VLModel
 
-        # 调用视觉编码器 (Qwen3.5 返回 BaseModelOutputWithPooling)
+        # 调用视觉编码器
         _pixel_values = pixel_values.to(dtype=inner_model.visual.dtype)
         vision_output = inner_model.visual(
             _pixel_values, grid_thw=image_grid_thw
         )
-        merged_hidden_states = _extract_visual_output(vision_output)
+        merged_hidden_states, deepstack_features = _extract_visual_output(vision_output)
 
-        # merged_hidden_states: [total_visual_tokens, out_hidden_size=2048]
+        # merged_hidden_states: [total_visual_tokens, out_hidden_size=4096]
         # 按图像分组
         split_sizes = (
             image_grid_thw.prod(-1) // inner_model.visual.spatial_merge_size ** 2
         ).tolist()
 
-        # 对于单图像输入，直接 unsqueeze 即可
-        # 对于 batch 内有多张图 (但每个样本单图)，需要分组
         visual_token_list = torch.split(merged_hidden_states, split_sizes)
 
-        # 单图像: 每个样本一张图
-        # 如果是单样本或 batch 场景，需要合适处理
-        # 这里假设 batch 内所有图像按顺序排列
         if len(visual_token_list) == 1:
-            # 单图像，加 batch 维
-            return visual_token_list[0].unsqueeze(0)
+            return visual_token_list[0].unsqueeze(0), deepstack_features
         else:
-            # 多个样本，每个样本单图，pad 到相同长度
             max_len = max(t.shape[0] for t in visual_token_list)
             B = len(visual_token_list)
             D = visual_token_list[0].shape[-1]
@@ -325,7 +301,7 @@ class RLDModel(nn.Module):
             for i, t in enumerate(visual_token_list):
                 padded[i, :t.shape[0]] = t
 
-            return padded  # [B, max_L_v, hidden_size]
+            return padded, deepstack_features
 
     def _build_prefix_mrope_ids(self, mrope_anchor: torch.Tensor, K_p: int) -> torch.Tensor:
         """
@@ -387,6 +363,8 @@ class RLDModel(nn.Module):
             skip_prefix: bool = False,
             mrope_position_offset: Optional[torch.Tensor] = None,
             cached_visual_embeds: Optional[torch.Tensor] = None,
+            cached_deepstack_features: Optional[list] = None,
+            cached_visual_pos_masks: Optional[torch.Tensor] = None,
     ) -> dict:
         """
         带 prefix embedding 注入的前向传播 (方案 A - 梯度连通)
@@ -456,7 +434,7 @@ class RLDModel(nn.Module):
             prefix_attn = torch.ones(B, K_p, device=attention_mask.device, dtype=attention_mask.dtype)
             extended_attention_mask = torch.cat([prefix_attn, attention_mask], dim=1)
 
-        inner_model = self.base_model.model  # Qwen3_5Model
+        inner_model = self.base_model.model  # Qwen3VLModel
         lm_head = self.base_model.lm_head
 
         # ---- Step 1: Embedding ----
@@ -480,12 +458,12 @@ class RLDModel(nn.Module):
                 image_mask_3d = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask_3d, image_embeds)
         elif pixel_values is not None:
-            # 回退: 如果没有缓存，运行视觉 encoder (Qwen3.5 返回 BaseModelOutputWithPooling)
+            # 回退: 如果没有缓存，运行视觉 encoder (Qwen3-VL 返回 (hidden_states, deepstack_features))
             _pixel_values = pixel_values.to(dtype=inner_model.visual.dtype)
             vision_output = inner_model.visual(
                 _pixel_values, grid_thw=image_grid_thw
             )
-            merged_hidden_states = _extract_visual_output(vision_output)
+            merged_hidden_states, _deepstack_feats = _extract_visual_output(vision_output)
             split_sizes = (
                 image_grid_thw.prod(-1) // inner_model.visual.spatial_merge_size ** 2
             ).tolist()
@@ -501,15 +479,11 @@ class RLDModel(nn.Module):
         # ---- Step 2.5: 提前初始化 cache 并计算 past_seen ----
         # 关键修复: 必须在 Step 3 构造 position_ids 之前确定 past_seen，
         # 用它覆盖 global_position_offset，确保 text_position_ids 和 cache_position 严格一致。
-        text_model = inner_model.language_model  # Qwen3_5TextModel
+        text_model = inner_model.language_model  # Qwen3VLTextModel
 
         if past_key_values is None:
-            try:
-                from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
-                cache = Qwen3_5DynamicCache(config=text_model.config)
-            except (ImportError, AttributeError):
-                from transformers.cache_utils import DynamicCache
-                cache = DynamicCache()
+            from transformers.cache_utils import DynamicCache
+            cache = DynamicCache()
         else:
             cache = past_key_values
 
@@ -519,7 +493,7 @@ class RLDModel(nn.Module):
 
         # ---- Step 3: 位置编码 (核心修改: 真实 token 位置不偏移) ----
         #
-        # Qwen3.5 的 position_ids 结构: [3, B, seq_len] (mRoPE: temporal, height, width)
+        # Qwen3-VL 的 position_ids 结构: [3, B, seq_len] (mRoPE: temporal, height, width)
         # 或 [4, B, seq_len] (第 0 维是 text_position_ids 用于 causal mask)
         #
         # 关键设计:
@@ -537,20 +511,14 @@ class RLDModel(nn.Module):
         # 为 get_rope_index 构造只覆盖当前段的 mask
         seg_token_mask = torch.ones(B, seq_len, device=input_ids.device, dtype=torch.long)
 
-        # 构造 mm_token_type_ids: text=0, image=1, video=2
-        # get_rope_index 需要此参数来区分不同模态 token 的位置编码方式
-        # 注意: 只有当 image_grid_thw 存在时才标记 image token，
-        # 否则 get_rope_index 内部会尝试从 None iterator 中取值导致 TypeError
-        image_token_id_for_rope = inner_model.config.image_token_id
-        mm_token_type_ids = torch.zeros(B, seq_len, device=input_ids.device, dtype=torch.int)
+        # 构造 mm_token_type_ids 和 get_rope_index 参数
+        # Qwen3-VL 的 get_rope_index 不需要 mm_token_type_ids 参数，
+        # 它自动从 input_ids 中检测 image/video token
         has_image = pixel_values is not None and image_grid_thw is not None
-        if has_image:
-            mm_token_type_ids[input_ids == image_token_id_for_rope] = 1
 
         inner_model.rope_deltas = None
         position_ids_computed, rope_deltas = inner_model.get_rope_index(
             input_ids,
-            mm_token_type_ids=mm_token_type_ids,
             image_grid_thw=image_grid_thw if has_image else None,
             video_grid_thw=None,
             attention_mask=seg_token_mask,
@@ -637,7 +605,7 @@ class RLDModel(nn.Module):
             prefix_embeds = prefix_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
             inputs_embeds = torch.cat([prefix_embeds, inputs_embeds], dim=1)
 
-        # ---- Step 5: 调用 Qwen3_5TextModel.forward ----
+        # ---- Step 5: 调用 Qwen3VLTextModel.forward ----
         # prefix embedding 作为 inputs_embeds 的一部分，自然参与整个 forward
         # 无需 hook、无需手动展开 decoder 层
         lm_head = self.base_model.lm_head
@@ -648,8 +616,16 @@ class RLDModel(nn.Module):
             past_seen, past_seen + total_len, device=inputs_embeds.device
         )
 
-        # 直接调用 text model，无需 hook
-        # Qwen3.5 无 deepstack，不需传 visual_pos_masks/deepstack_visual_embeds
+        # Qwen3-VL 有 DeepStack，当段包含 visual token 时需要传入
+        # 对于纯文本段 (没有 image placeholder)，传 None 即可
+        _visual_pos_masks = cached_visual_pos_masks
+        _deepstack_visual_embeds = cached_deepstack_features
+        
+        # 如果有 prefix 拼接，需要在 visual_pos_masks 前面补 K_p 个 False
+        if _visual_pos_masks is not None and not skip_prefix and K_p > 0:
+            prefix_mask = torch.zeros(B, K_p, device=device, dtype=torch.bool)
+            _visual_pos_masks = torch.cat([prefix_mask, _visual_pos_masks], dim=1)
+        
         text_outputs = text_model(
             inputs_embeds=inputs_embeds,
             attention_mask=extended_attention_mask,
@@ -657,6 +633,8 @@ class RLDModel(nn.Module):
             past_key_values=cache,
             cache_position=cache_position,
             use_cache=True,
+            visual_pos_masks=_visual_pos_masks,
+            deepstack_visual_embeds=_deepstack_visual_embeds,
         )
 
         hidden_states = text_outputs.last_hidden_state
@@ -745,6 +723,7 @@ class RLDModel(nn.Module):
         # ====== 1. 获取视觉 token 并初始化 RLD 状态 ======
         # P1-1: 视觉 encoder 只跑一次，缓存特征供后续复用
         cached_visual_embeds = None     # 缓存的视觉 embedding (用于 placeholder 替换)
+        deepstack_features = None       # DeepStack 视觉特征 (用于 decoder 前几层注入)
 
         if pixel_values is not None:
             inner_model = self.base_model.model
@@ -752,7 +731,7 @@ class RLDModel(nn.Module):
             vision_output = inner_model.visual(
                 _pixel_values, grid_thw=image_grid_thw
             )
-            merged_hidden_states = _extract_visual_output(vision_output)
+            merged_hidden_states, deepstack_features = _extract_visual_output(vision_output)
             split_sizes = (
                 image_grid_thw.prod(-1) // inner_model.visual.spatial_merge_size ** 2
             ).tolist()
@@ -798,6 +777,16 @@ class RLDModel(nn.Module):
             prompt_ids = input_ids[:, :prompt_end]
             prompt_mask = attention_mask[:, :prompt_end]
             
+            # 构造 visual_pos_masks (标记 prompt 中哪些位置是 image token)
+            # DeepStack 需要此 mask 来在 decoder 前几层注入视觉特征
+            prompt_visual_pos_masks = None
+            prompt_deepstack_features = None
+            if pixel_values is not None and image_grid_thw is not None:
+                inner_model = self.base_model.model
+                image_token_id = inner_model.config.image_token_id
+                prompt_visual_pos_masks = (prompt_ids == image_token_id)  # [B, prompt_end]
+                prompt_deepstack_features = deepstack_features
+            
             prefill_result = self.forward_with_prefix_embeds(
                 input_ids=prompt_ids,
                 attention_mask=prompt_mask,
@@ -808,29 +797,21 @@ class RLDModel(nn.Module):
                 global_position_offset=0,
                 past_key_values=None,
                 cached_visual_embeds=cached_visual_embeds,
+                cached_deepstack_features=prompt_deepstack_features,
+                cached_visual_pos_masks=prompt_visual_pos_masks,
             )
             
             past_key_values = prefill_result['past_key_values']
             mrope_position_offset = prefill_result['mrope_last_pos']  # [3, B, 1]
             
             # KV cache detach: prompt 部分不需要梯度回传
-            # 关键修复: 必须同时 detach conv_states 和 recurrent_states (linear_attention 层),
-            # 否则梯度会通过这些状态回传到已释放的计算图，导致 CUDA invalid memory access。
+            # Qwen3-VL 使用标准 DynamicCache，只需 detach key/value cache
             if past_key_values is not None:
                 for _li in range(len(past_key_values.key_cache)):
                     if past_key_values.key_cache[_li] is not None:
                         past_key_values.key_cache[_li] = past_key_values.key_cache[_li].detach()
                     if past_key_values.value_cache[_li] is not None:
                         past_key_values.value_cache[_li] = past_key_values.value_cache[_li].detach()
-                # detach linear_attention 层的 conv_states 和 recurrent_states
-                if hasattr(past_key_values, 'conv_states'):
-                    for _li in range(len(past_key_values.conv_states)):
-                        if past_key_values.conv_states[_li] is not None:
-                            past_key_values.conv_states[_li] = past_key_values.conv_states[_li].detach()
-                if hasattr(past_key_values, 'recurrent_states'):
-                    for _li in range(len(past_key_values.recurrent_states)):
-                        if past_key_values.recurrent_states[_li] is not None:
-                            past_key_values.recurrent_states[_li] = past_key_values.recurrent_states[_li].detach()
             
             global_position_offset = prompt_end
             
@@ -957,7 +938,7 @@ class RLDModel(nn.Module):
                 # ---- 段 0 (prompt 已 prefill): forward [prefix | seg_tokens] 接在 prompt_kv 后面 ----
                 # cache 中已有 prompt_kv，构造 attention_mask 覆盖 [prompt_kv + seg_tokens]
                 # forward_with_prefix_embeds 会在左侧加 K_p 个 1
-                # 使用 full_attention 层的实际 KV cache 长度，避免 linear_attention 层值不一致
+                # 使用 _get_full_attn_cache_len 安全获取 KV cache 长度
                 actual_cache_len = self._get_full_attn_cache_len(past_key_values)
                 current_total_attn_len = actual_cache_len + seg_len
                 seg_mask = torch.ones(B, current_total_attn_len, device=device, dtype=attention_mask.dtype)
@@ -1006,14 +987,10 @@ class RLDModel(nn.Module):
                 # 需要剥离 prefix_kv，保留 prompt_kv + history_seg_kv
                 _cache_before_strip = self._get_full_attn_cache_len(past_key_values) if past_key_values is not None else 0
                 if past_key_values is not None:
-                    text_model_layers = self.base_model.model.language_model.layers
                     for _li in range(len(past_key_values.key_cache)):
-                        layer = text_model_layers[_li]
-                        if layer.layer_type != "full_attention":
-                            continue
+                        # Qwen3-VL: 所有层都是标准 full_attention，直接剥离
                         kc = past_key_values.key_cache[_li]
-                        if kc.shape[2] > prompt_kv_len + K_p:
-                            # 保留 prompt_kv + 剥离 prefix_kv + 保留 history_seg_kv
+                        if kc is not None and kc.dim() == 4 and kc.shape[2] > prompt_kv_len + K_p:
                             past_key_values.key_cache[_li] = torch.cat([
                                 kc[:, :, :prompt_kv_len, :],
                                 kc[:, :, prompt_kv_len + K_p:, :],
@@ -1068,23 +1045,13 @@ class RLDModel(nn.Module):
                     print(f"    logits shape={_logits.shape}, has_nan={_logits_nan}, has_inf={_logits_inf}")
 
             # KV cache detach: 阻止跨段 attention 梯度，控制内存
-            # 关键修复: 必须同时 detach conv_states 和 recurrent_states (linear_attention 层),
-            # 否则梯度会通过这些状态回传到已释放的计算图，导致 CUDA invalid memory access。
+            # Qwen3-VL 使用标准 DynamicCache，只需 detach key/value cache
             if past_key_values is not None:
                 for _li in range(len(past_key_values.key_cache)):
                     if past_key_values.key_cache[_li] is not None:
                         past_key_values.key_cache[_li] = past_key_values.key_cache[_li].detach()
                     if past_key_values.value_cache[_li] is not None:
                         past_key_values.value_cache[_li] = past_key_values.value_cache[_li].detach()
-                # detach linear_attention 层的 conv_states 和 recurrent_states
-                if hasattr(past_key_values, 'conv_states'):
-                    for _li in range(len(past_key_values.conv_states)):
-                        if past_key_values.conv_states[_li] is not None:
-                            past_key_values.conv_states[_li] = past_key_values.conv_states[_li].detach()
-                if hasattr(past_key_values, 'recurrent_states'):
-                    for _li in range(len(past_key_values.recurrent_states)):
-                        if past_key_values.recurrent_states[_li] is not None:
-                            past_key_values.recurrent_states[_li] = past_key_values.recurrent_states[_li].detach()
             # 关键修复: 不再手动累积 global_position_offset
             # forward_with_prefix_embeds 内部用 past_seen (cache 实际长度) 覆盖了它，
             # 这样 text_position_ids 和 cache_position 始终一致。
@@ -1334,6 +1301,8 @@ class RLDModel(nn.Module):
                 past_key_values=past_key_values,
                 cache_position=cache_position,
                 use_cache=True,
+                visual_pos_masks=None,
+                deepstack_visual_embeds=None,
             )
 
             past_key_values = text_outputs.past_key_values
@@ -1450,14 +1419,8 @@ class RLDModel(nn.Module):
         position_ids = position_ids.to(device)
 
         # 2. 用 text_model.forward 生成 prefix 的 KV cache
-        #    prefix 只需做自身的 self-attention (不需要看历史 cache)
-        # Qwen3.5 使用混合 cache (linear + full attn)
-        try:
-            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
-            prefix_cache = Qwen3_5DynamicCache(config=text_model.config)
-        except (ImportError, AttributeError):
-            from transformers.cache_utils import DynamicCache
-            prefix_cache = DynamicCache()
+        from transformers.cache_utils import DynamicCache
+        prefix_cache = DynamicCache()
         cache_position = torch.arange(K_p, device=device)
         prefix_attn_mask = torch.ones(B_size, K_p, device=device, dtype=torch.long)
 
@@ -1469,16 +1432,14 @@ class RLDModel(nn.Module):
             past_key_values=prefix_cache,
             cache_position=cache_position,
             use_cache=True,
+            visual_pos_masks=None,
+            deepstack_visual_embeds=None,
         )
         new_prefix_cache = _prefix_outputs.past_key_values
 
         # 3. 可微替换: 把旧 cache 的前 K_p 个 KV 换成新计算的
-        # Qwen3.5 混合架构: 只有 full_attention 层有 KV cache
-        # linear_attention 层使用 recurrent_state，不有标准 KV cache
+        # Qwen3-VL: 所有层都是标准 full_attention
         for layer_idx in range(len(text_model.layers)):
-            layer = text_model.layers[layer_idx]
-            if layer.layer_type != "full_attention":
-                continue  # 跳过 linear_attention 层
             new_key = new_prefix_cache.key_cache[layer_idx]     # [B, H, K_p, D]
             new_value = new_prefix_cache.value_cache[layer_idx]  # [B, H, K_p, D]
             
@@ -1513,13 +1474,8 @@ class RLDModel(nn.Module):
         position_ids = position_ids.to(device)
 
         # 2. 用 text_model.forward 生成 prefix 的 KV cache
-        # Qwen3.5 使用混合 cache (linear + full attn)
-        try:
-            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
-            prefix_cache = Qwen3_5DynamicCache(config=text_model.config)
-        except (ImportError, AttributeError):
-            from transformers.cache_utils import DynamicCache
-            prefix_cache = DynamicCache()
+        from transformers.cache_utils import DynamicCache
+        prefix_cache = DynamicCache()
         cache_position = torch.arange(K_p, device=device)
         prefix_attn_mask = torch.ones(B_size, K_p, device=device, dtype=torch.long)
 
@@ -1530,15 +1486,14 @@ class RLDModel(nn.Module):
             past_key_values=prefix_cache,
             cache_position=cache_position,
             use_cache=True,
+            visual_pos_masks=None,
+            deepstack_visual_embeds=None,
         )
         new_prefix_cache = _prefix_outputs.past_key_values
 
         # 3. inplace 覆盖 cache 中前 K_p 个位置
-        # Qwen3.5 混合架构: 只有 full_attention 层有 KV cache
+        # Qwen3-VL: 所有层都是标准 full_attention
         for layer_idx in range(len(text_model.layers)):
-            layer = text_model.layers[layer_idx]
-            if layer.layer_type != "full_attention":
-                continue  # 跳过 linear_attention 层
             past_key_values.key_cache[layer_idx][:, :, :K_p, :] = new_prefix_cache.key_cache[layer_idx]
             past_key_values.value_cache[layer_idx][:, :, :K_p, :] = new_prefix_cache.value_cache[layer_idx]
 

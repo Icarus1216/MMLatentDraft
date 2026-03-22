@@ -118,12 +118,12 @@ def main():
 
     model_kwargs = dict(
         model_path=model_config['model_path'],
-        hidden_size=model_config.get('hidden_size', 2048),
+        hidden_size=model_config.get('hidden_size', 4096),
         d_z=rld_config.get('d_z', 512),
         num_evidence_slots=rld_config.get('num_evidence_slots', 16),
         num_draft_slots=rld_config.get('num_draft_slots', 16),
         num_trace_slots=rld_config.get('num_trace_slots', 16),
-        total_layers=model_config.get('total_layers', 48),
+        total_layers=model_config.get('total_layers', 36),
         torch_dtype=getattr(torch, model_config.get('torch_dtype', 'bfloat16')),
         attn_implementation=model_config.get('attn_implementation', 'flash_attention_2'),
         lambda_div=rld_config.get('lambda_div', 0.01),

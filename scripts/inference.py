@@ -50,13 +50,13 @@ class RLDInference:
         torch_dtype=torch.bfloat16,
         attn_implementation: str = "flash_attention_2",
         # 模型参数
-        hidden_size: int = 2560,
+        hidden_size: int = 4096,
         # RLD 参数
         d_z: int = 512,
         num_evidence_slots: int = 16,
         num_draft_slots: int = 16,
         num_trace_slots: int = 16,
-        total_layers: int = 32,
+        total_layers: int = 36,
         # System prompt 控制
         use_system_prompt: bool = True,
         system_prompt: str = None,
@@ -201,7 +201,7 @@ class RLDInference:
 
 def main():
     parser = argparse.ArgumentParser(description="RLD Inference")
-    parser.add_argument("--model_path", type=str, required=True, help="Qwen3.5 模型路径")
+    parser.add_argument("--model_path", type=str, required=True, help="Qwen3-VL 模型路径")
     parser.add_argument("--rld_checkpoint", type=str, required=True, help="RLD controller 权重路径")
     parser.add_argument("--image", type=str, default=None, help="图像路径")
     parser.add_argument("--question", type=str, default=None, help="问题文本")

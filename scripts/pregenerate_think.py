@@ -92,7 +92,7 @@ from PIL import Image
 # ============================================================
 
 # Stage 1: 自由推理 (与训练时的 RLD_SYSTEM_PROMPT 完全一致)
-# Qwen3.5 的 thinking 模式是内建的，apply_chat_template 会自动输出 <think>\n，
+# Qwen3-VL 的 thinking 模式是内建的，apply_chat_template 会自动输出 <think>\n，
 # 因此 system prompt 不需要教模型 <think>/<\/think> 格式，只需教 </step> 分步规范。
 FREE_REASONING_SYSTEM_PROMPT = """You are a visual reasoning assistant. When thinking through problems, break your reasoning into clear steps separated by </step>.
 

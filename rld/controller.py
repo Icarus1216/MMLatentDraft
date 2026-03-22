@@ -38,12 +38,12 @@ class RLDController(nn.Module):
     - T: 累计推理轨迹 [B, K_t, d_z] (每个 step 边界更新)
     
     Args:
-    hidden_size: Qwen3.5 的隐藏维度 (2560 for 4B)
+    hidden_size: Qwen3-VL 的隐藏维度 (4096 for 8B)
         d_z: controller 空间维度 (512)
         num_evidence_slots: 证据槽数量 K_e (默认 16)
         num_draft_slots: 草稿槽数量 K_d (默认 16)
         num_trace_slots: 轨迹槽数量 K_t (默认 16)
-        total_layers: 基座模型总层数 (32 for Qwen3.5-4B)
+        total_layers: 基座模型总层数 (36 for Qwen3-VL-8B)
         num_heads: cross-attention 头数 (默认 8)
         evidence_layers: evidence resampler 的层数 (默认 2)
         use_gate: 草稿更新是否使用门控 (默认 True)
@@ -52,12 +52,12 @@ class RLDController(nn.Module):
 
     def __init__(
         self,
-        hidden_size: int = 2560,
+        hidden_size: int = 4096,
         d_z: int = 512,
         num_evidence_slots: int = 16,
         num_draft_slots: int = 16,
         num_trace_slots: int = 16,
-        total_layers: int = 32,
+        total_layers: int = 36,
         num_heads: int = 8,
         evidence_layers: int = 2,
         use_gate: bool = True,

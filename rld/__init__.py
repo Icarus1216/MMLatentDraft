@@ -1,10 +1,10 @@
 """
-RLD (Reflective Latent Draft) —— 面向 Qwen3.5 的步级"回看-验证"隐空间草稿
+RLD (Reflective Latent Draft) —— 面向 Qwen3-VL 的步级"回看-验证"隐空间草稿
 
 核心模块:
 - modules: 基础组件 (Resampler, CrossAttention, Embedding Projector 等)
 - controller: RLD 控制器，编排 draft 生命周期
-- model: 包装 Qwen3.5 的 RLD 模型
+- model: 包装 Qwen3-VL 的 RLD 模型
 - data: 数据集与 Collator
 - trainer: 自定义 Trainer (支持步段展开训练)
 """
