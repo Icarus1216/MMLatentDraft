@@ -72,9 +72,10 @@ def main():
     set_seed(42)
     processor = AutoProcessor.from_pretrained(model_config['model_path'])
 
-    # 强制使用 eager attention，排除 flash_attention_2 环境兼容性问题
-    # 若 eager 通过但 flash_attention_2 失败，说明是 FA2 环境/版本问题
-    attn_impl = os.environ.get('RLD_ATTN_IMPL', 'eager')
+    # 默认使用 sdpa (PyTorch 原生 Scaled Dot Product Attention)
+    # sdpa 比 eager 快 (利用 PyTorch 内置优化), 比 flash_attention_2 兼容性更好
+    # 可通过 RLD_ATTN_IMPL 环境变量切换: eager / sdpa / flash_attention_2
+    attn_impl = os.environ.get('RLD_ATTN_IMPL', 'sdpa')
     orig_attn = model_config.get('attn_implementation', 'flash_attention_2')
     if attn_impl != orig_attn:
         print(f"   ⚠️  注意力实现: {orig_attn} → {attn_impl} (通过 RLD_ATTN_IMPL 环境变量覆盖)")
