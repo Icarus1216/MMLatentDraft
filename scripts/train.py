@@ -10,19 +10,7 @@ RLD 训练脚本
     deepspeed --num_gpus=8 scripts/train.py --config configs/rld_train.yaml
 """
 
-# ============================================================
-# 关键: NCCL 超时必须在 import torch / deepspeed 之前设置!
-# DeepSpeed launcher 在 import 阶段就可能初始化 ProcessGroup,
-# 此时如果环境变量尚未设置, 超时会使用 PyTorch 默认的 600 秒。
-# ============================================================
 import os
-os.environ.setdefault('DEEPSPEED_TIMEOUT', '7200')       # DeepSpeed ProcessGroup 超时 2 小时
-os.environ.setdefault('TORCH_NCCL_TIMEOUT_S', '7200')    # PyTorch NCCL watchdog 超时 2 小时
-os.environ.setdefault('NCCL_TIMEOUT', '7200')            # 兼容旧版本
-os.environ.setdefault('TORCH_NCCL_BLOCKING_WAIT', '0')   # 非阻塞等待
-os.environ.setdefault('TORCH_NCCL_ASYNC_ERROR_HANDLING', '1')
-os.environ.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
-
 import sys
 import argparse
 import yaml
@@ -71,22 +59,6 @@ def _is_main_process():
 def main():
     args = parse_args()
     config = load_config(args.config)
-
-    # NCCL 超时已在文件顶部 (import 之前) 设置为 7200 秒
-    # 此处进行运行时兜底: 如果 ProcessGroup 已初始化, 动态修改其超时
-    from datetime import timedelta
-    if torch.distributed.is_initialized():
-        # 动态修改已创建的 ProcessGroup 超时 (PyTorch 2.0+)
-        try:
-            pg = torch.distributed.distributed_c10d._get_default_group()
-            pg._get_backend(torch.device('cuda'))._set_default_timeout(
-                timedelta(seconds=7200)
-            )
-            if is_main:
-                print(f"[RLD] ✅ 已动态设置 NCCL 超时为 7200 秒")
-        except Exception as e:
-            if is_main:
-                print(f"[RLD] ⚠️ 动态设置 NCCL 超时失败 (可忽略): {e}")
 
     model_config = config['model']
     data_config = config['data']
@@ -222,7 +194,7 @@ def main():
         deepspeed=training_config.get('deepspeed_config'),
         report_to=["tensorboard"],
         seed=seed,
-        ddp_timeout=7200,  # NCCL 超时 2 小时 (匹配 TORCH_NCCL_TIMEOUT_S 环境变量)
+        ddp_timeout=1800,  # DDP 超时 (默认)
     )
 
     # ====== 6. 创建 Trainer ======

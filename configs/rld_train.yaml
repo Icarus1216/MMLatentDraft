@@ -19,7 +19,7 @@ model:
   hidden_size: 2560          # Qwen3.5-4B 隐藏维度 (稠密模型)
   total_layers: 32           # Qwen3.5-4B decoder 总层数 (config.json: num_hidden_layers=32)
   torch_dtype: "bfloat16"
-  attn_implementation: "sdpa"       # sdpa 兼容性好; flash_attention_2 待环境修复后可切换
+  attn_implementation: "flash_attention_2"
 
 # RLD Controller 配置
 rld:

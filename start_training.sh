@@ -31,23 +31,15 @@ fi
 echo "GPU 数量: $GPU_COUNT"
 echo ""
 
-# NCCL 配置: 防止长样本导致通信超时
-# 关键: DeepSpeed 使用 DEEPSPEED_TIMEOUT 环境变量控制 ProcessGroup 超时 (秒),
-#       而非 NCCL_TIMEOUT 或 TORCH_NCCL_TIMEOUT_S。
-#       TORCH_NCCL_TIMEOUT_S 控制 PyTorch 内部 ProcessGroupNCCL watchdog 超时。
-#       两者都需要设置才能完全覆盖默认的 600 秒超时。
-export DEEPSPEED_TIMEOUT=7200      # DeepSpeed ProcessGroup 超时 7200 秒 (2 小时)
-export TORCH_NCCL_TIMEOUT_S=7200   # PyTorch NCCL watchdog 超时 7200 秒 (2 小时)
-export NCCL_TIMEOUT=7200           # 兼容旧版本
-export TORCH_NCCL_BLOCKING_WAIT=0  # 非阻塞等待
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1  # 使用新版变量名
-export TORCH_NCCL_TRACE_BUFFER_SIZE=1000  # 启用 FlightRecorder 便于调试
+# NCCL 配置
 export NCCL_DEBUG=WARN             # NCCL 日志级别
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_TRACE_BUFFER_SIZE=1000  # 启用 FlightRecorder 便于调试
 
 # 注意力实现切换 (flash_attention_2 / sdpa / eager)
-# flash_attention_2 当前与 Qwen3.5 存在兼容性问题 (CUDA illegal memory access),
-# 暂时使用 sdpa。待 flash-attn 环境修复后，注释掉下面这行即可切回 flash_attention_2:
-export RLD_ATTN_IMPL=sdpa
+# 默认使用 flash_attention_2 (最快)，如需切换可设置环境变量:
+#   export RLD_ATTN_IMPL=sdpa
+#   export RLD_ATTN_IMPL=eager
 
 # 创建输出目录
 mkdir -p outputs/rld_train
