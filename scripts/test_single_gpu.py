@@ -72,6 +72,13 @@ def main():
     set_seed(42)
     processor = AutoProcessor.from_pretrained(model_config['model_path'])
 
+    # 强制使用 eager attention，排除 flash_attention_2 环境兼容性问题
+    # 若 eager 通过但 flash_attention_2 失败，说明是 FA2 环境/版本问题
+    attn_impl = os.environ.get('RLD_ATTN_IMPL', 'eager')
+    orig_attn = model_config.get('attn_implementation', 'flash_attention_2')
+    if attn_impl != orig_attn:
+        print(f"   ⚠️  注意力实现: {orig_attn} → {attn_impl} (通过 RLD_ATTN_IMPL 环境变量覆盖)")
+    
     model = RLDModel(
         model_path=model_config['model_path'],
         hidden_size=model_config.get('hidden_size', 2048),
@@ -81,7 +88,7 @@ def main():
         num_trace_slots=rld_config.get('num_trace_slots', 16),
         total_layers=model_config.get('total_layers', 48),
         torch_dtype=getattr(torch, model_config.get('torch_dtype', 'bfloat16')),
-        attn_implementation=model_config.get('attn_implementation', 'flash_attention_2'),
+        attn_implementation=attn_impl,
         lambda_div=rld_config.get('lambda_div', 0.01),
     )
     model.set_processor(processor)
