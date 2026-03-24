@@ -20,10 +20,16 @@ Collator: 批处理，检测 step 边界位置
 
 import json
 import os
+import re
 import warnings
 import torch
 from torch.utils.data import Dataset
 from transformers import AutoProcessor
+
+
+class _SampleTooLongError(Exception):
+    """样本序列超长且无法截断时抛出，触发 _get_item_safe 重试其他样本"""
+    pass
 
 try:
     from qwen_vl_utils import process_vision_info
@@ -33,13 +39,28 @@ except ImportError:
 
 
 # ====== RLD System Prompt (Qwen3-VL 格式) ======
-# Qwen3-VL 的 thinking 模式是内建的 — chat_template 的 add_generation_prompt
-# 会自动输出 `<|im_start|>assistant\n<think>\n`，模型已被训练为在 <think> 内思考。
-# 因此 system prompt 不需要教模型 <think>/<\think> 格式（冗余且可能冲突），
-# 只需要教 RLD 自定义的 </step> 分步规范。
-RLD_SYSTEM_PROMPT = """You are a visual reasoning assistant. When thinking through problems, break your reasoning into clear steps separated by </step>.
+# Qwen3-VL-8B-Instruct 是 Instruct 模型，chat_template 的 add_generation_prompt
+# 只输出 `<|im_start|>assistant\n`，**不会**自动添加 `<think>\n`。
+# （与 Qwen3 文本模型不同，Qwen3-VL 不支持 enable_thinking 参数。）
+# 因此我们在训练时手动拼接 `<think>\n...\n</think>\n\n` 包裹推理过程，
+# system prompt 显式要求模型: 1) 用 <think></think> 包裹思维链  2) 用 </step> 分步  3) </think> 后输出最终答案
+# 这保证了训推一致性: 训练数据中硬编码了 <think>...</think>\n\n{answer} 格式,
+# 推理时模型也会被 prompt 引导自主输出相同格式。
+RLD_SYSTEM_PROMPT = """You are a visual reasoning assistant. You must structure your response as follows:
 
-For each distinct observation, calculation, or deduction, end that step with </step> before moving on."""
+1. Wrap your reasoning process inside <think> and </think> tags.
+2. Inside the thinking block, break your reasoning into clear steps, ending each step with </step>.
+3. After </think>, output your final answer directly.
+
+Example format:
+<think>
+I observe that the triangle has a base of 6 and height of 8.
+</step>
+Using the formula: Area = 0.5 × base × height = 0.5 × 6 × 8 = 24.
+</step>
+</think>
+
+The area of the triangle is 24 square units."""
 
 
 class RLDDataset(Dataset):
@@ -72,8 +93,8 @@ class RLDDataset(Dataset):
     
     训练时的序列构造 (符合 Qwen3-VL 官方 chat_template):
       [prompt]<|im_start|>assistant\n<think>\n{steps}\n</step>\n</think>\n\n{answer}<|im_end|>
-      其中 `<|im_start|>assistant\n<think>\n` 由 apply_chat_template(add_generation_prompt=True) 自动生成,
-      think_block 只包含 think 内部内容 (不含 <think>/</think> 标签),
+      其中 `<|im_start|>assistant\n` 由 apply_chat_template(add_generation_prompt=True) 自动生成,
+      我们手动拼接 `<think>\n{think_inner}</think>\n\n` 包裹推理过程,
       `</think>\n\n` 作为过渡衔接 think 块和 final answer。
       
     labels 策略 (分段监督, 根据 think_chain_source 决定):
@@ -84,8 +105,9 @@ class RLDDataset(Dataset):
       - </think> 后的 final answer + <|im_end|>: 真实 token id (始终参与 loss)
     
     推理时:
-      模型根据 system prompt 自主在 <think> 内生成推理过程，
-      遇到 </step> 触发 RLD 更新，</think> 后输出最终答案。
+      模型根据 system prompt 的显式指令，输出 <think>...</think> 包裹的推理过程，
+      遇到 </step> 触发 RLD 更新，</think>\n\n 后输出最终答案。
+      推理时在 generation prompt 后追加 `<think>\n` 确保训推一致。
     
     Args:
         json_path: 数据 JSON 文件路径
@@ -145,6 +167,18 @@ class RLDDataset(Dataset):
                 print(f"[RLDDataset]   保留 {len(valid_data)}/{len(raw_data)}")
         self.data = valid_data
         
+        # 过滤超高段数样本 (>14 段的样本会导致显存峰值过高, 触发 CUDA 错误)
+        MAX_STEPS_FILTER = 14
+        before_filter = len(self.data)
+        self.data = [
+            item for item in self.data
+            if item.get('think_chain', '').count('</step>') <= MAX_STEPS_FILTER
+        ]
+        filtered_by_steps = before_filter - len(self.data)
+        if filtered_by_steps > 0:
+            print(f"[RLDDataset] ⚠️ 已过滤 {filtered_by_steps} 个超高段数(>{MAX_STEPS_FILTER})的样本")
+            print(f"[RLDDataset]   保留 {len(self.data)}/{before_filter}")
+        
         self.processor = processor
         self.auto_split_steps = auto_split_steps
         self.max_tokens_per_step = max_tokens_per_step
@@ -152,6 +186,14 @@ class RLDDataset(Dataset):
         self.system_prompt = system_prompt or RLD_SYSTEM_PROMPT
         self.max_seq_len = max_seq_len
 
+        # 确认图片分辨率限制已生效 (由 train.py 在 processor 上设置)
+        if hasattr(self.processor, 'image_processor'):
+            _ip = self.processor.image_processor
+            _min_px = getattr(_ip, 'min_pixels', None)
+            _max_px = getattr(_ip, 'max_pixels', None)
+            print(f"[RLDDataset] 图片分辨率: min_pixels={_min_px}, max_pixels={_max_px}")
+            if _max_px and _max_px > 2_000_000:
+                print(f"[RLDDataset] ⚠️ max_pixels={_max_px} 过大! 建议设为 1003520 以避免 ViT 编码缓慢")
 
         # 确保 tokenizer 配置
         if self.processor.tokenizer.pad_token_id is None:
@@ -225,8 +267,8 @@ class RLDDataset(Dataset):
         3. 每个步骤后跟 </step>
         
         注意: 返回值不包含 <think>/</think> 标签!
-        apply_chat_template 的 generation prompt 已输出 <think>\n，
-        外层 _get_item_inner 会在末尾追加 </think>\n\n 衔接 final answer。
+        外层 _get_item_inner 会在拼接时手动添加 <think>\n 前缀和 </think>\n\n 后缀，
+        因为 Qwen3-VL-8B-Instruct 的 chat_template 不会自动输出 <think>。
         
         这些 token 不参与 loss，但为 RLD Controller
         提供 step 边界触发更新的机会。
@@ -272,8 +314,7 @@ class RLDDataset(Dataset):
 
         # 组装 think 内部内容: 每个步骤后跟 </step>
         # 注意: 不包裹 <think>/</think> 标签!
-        # apply_chat_template(add_generation_prompt=True) 已输出 `<think>\n`,
-        # 外层 _get_item_inner 会在末尾追加 `</think>\n\n` 衔接 final answer。
+        # 外层 _get_item_inner 会手动添加 `<think>\n` 前缀和 `</think>\n\n` 后缀。
         think_content = f"\n{self.STEP_DELIMITER}\n".join(steps)
         think_inner = f"{think_content}\n{self.STEP_DELIMITER}\n"
         
@@ -303,12 +344,18 @@ class RLDDataset(Dataset):
         return self._get_item_safe(idx)
 
     def _get_item_safe(self, idx, _retry=0):
-        """带容错的样本获取，图片加载失败时随机选另一个样本"""
+        """带容错的样本获取，图片加载失败或序列超长时随机选另一个样本"""
         import random
-        if _retry > 5:
-            raise RuntimeError(f"[RLDDataset] 连续 {_retry} 次采样失败，请检查数据集图片路径")
+        if _retry > 10:
+            raise RuntimeError(f"[RLDDataset] 连续 {_retry} 次采样失败，请检查数据集图片路径或 max_seq_len 设置")
         try:
             return self._get_item_inner(idx)
+        except _SampleTooLongError as e:
+            # 超长样本: 静默跳过, 随机替换 (不打印警告, 避免日志刷屏)
+            if _retry == 0:
+                warnings.warn(f"[RLDDataset] 样本 {idx} 超长被跳过: {e}")
+            new_idx = random.randint(0, len(self.data) - 1)
+            return self._get_item_safe(new_idx, _retry + 1)
         except (FileNotFoundError, OSError) as e:
             warnings.warn(f"[RLDDataset] 样本 {idx} 加载失败: {e}, 随机替换")
             new_idx = random.randint(0, len(self.data) - 1)
@@ -358,8 +405,8 @@ class RLDDataset(Dataset):
         # 优先使用预生成的推理链，fallback 到伪造 think 块
         
         # 获取 think 内部内容: 预生成 > 伪造
-        # 注意: apply_chat_template(add_generation_prompt=True) 已在 prompt 末尾
-        # 输出 `<|im_start|>assistant\n<think>\n`，因此 think_inner 不含 <think> 标签。
+        # 注意: Qwen3-VL-8B-Instruct 的 chat_template 只输出 `<|im_start|>assistant\n`，
+        # 不会自动添加 `<think>\n`。我们在下方拼接 think_with_close 时手动添加。
         # 预生成的 think_chain 格式为 `<think>\n...\n</step>\n</think>\n`，
         # 需要剥离外层 <think>/</think> 标签，只保留内部内容。
         think_chain = item.get('think_chain')
@@ -394,19 +441,53 @@ class RLDDataset(Dataset):
         final_answer = answer.strip()
         
         # 完整回答部分 (拼接在 generation prompt 之后):
-        # generation prompt 已输出: `<|im_start|>assistant\n<think>\n`
-        # 我们拼接: {think_inner}</think>\n\n{final_answer}<|im_end|>
-        # 其中 </think>\n\n 符合 Qwen3-VL 官方模板格式
+        # generation prompt 只输出: `<|im_start|>assistant\n`
+        # 我们手动拼接: <think>\n{think_inner}</think>\n\n{final_answer}<|im_end|>
         im_end_token = "<|im_end|>"
         
-        # 分别 tokenize think 内部内容 + </think>\n\n 过渡 和 final answer，以便精确设置 labels
-        # think_with_close = "{think_inner}</think>\n\n" — 包含 think 内容和关闭标签
-        think_with_close = think_inner + self.THINK_END + "\n\n"
+        # 分别 tokenize think 块 (含 <think>/</think> 标签) 和 final answer，以便精确设置 labels
+        # think_with_close = "<think>\n{think_inner}</think>\n\n" — 包含完整的 think 包裹
+        think_with_close = self.THINK_START + "\n" + think_inner + self.THINK_END + "\n\n"
         think_tokens = self.processor.tokenizer(
             think_with_close,
             add_special_tokens=False,
             return_tensors="pt",
         )
+
+        # ---- 精确计算 </step> 在 think_ids 中的边界位置 ----
+        # BPE tokenizer 会根据上下文合并 token (如 ">" + "\n" → ">\n"),
+        # 导致基于 token 子序列匹配的方式无法找到 delimiter。
+        # 使用 offset_mapping 在字符级精确定位每个 </step> 的最后一个 token 位置。
+        think_step_positions = []  # 相对于 think_ids 起始位置的偏移
+        if self.STEP_DELIMITER in think_with_close:
+            try:
+                # 方法1 (首选): 使用 tokenizer 的 offset_mapping 精确映射字符→token 位置
+                think_result = self.processor.tokenizer(
+                    think_with_close,
+                    add_special_tokens=False,
+                    return_offsets_mapping=True,
+                )
+                offsets = think_result['offset_mapping']  # [(char_start, char_end), ...]
+                
+                for m in re.finditer(re.escape(self.STEP_DELIMITER), think_with_close):
+                    end_char = m.end()  # </step> 在文本中的字符级结束位置
+                    # 找到覆盖 end_char 的 token (即 </step> 的最后一个 token)
+                    for tok_idx, (cs, ce) in enumerate(offsets):
+                        if cs < end_char and ce >= end_char:
+                            think_step_positions.append(tok_idx)
+                            break
+            except Exception:
+                # 方法2 (fallback): 累积 decode 匹配
+                think_ids_list = think_tokens['input_ids'][0].tolist()
+                cumulative_text = ""
+                delim_text = self.STEP_DELIMITER
+                for tok_idx, tid in enumerate(think_ids_list):
+                    cumulative_text += self.processor.tokenizer.decode([tid])
+                    while delim_text in cumulative_text:
+                        think_step_positions.append(tok_idx)
+                        pos = cumulative_text.find(delim_text)
+                        cumulative_text = cumulative_text[pos + len(delim_text):]
+                        break
         answer_tokens = self.processor.tokenizer(
             final_answer + im_end_token,
             add_special_tokens=False,
@@ -422,30 +503,47 @@ class RLDDataset(Dataset):
         answer_ids = answer_tokens['input_ids'][0]        # [answer_len]
         answer_mask = answer_tokens['attention_mask'][0]  # [answer_len]
 
-        # 完整序列
-        input_ids = torch.cat([prompt_ids, think_ids, answer_ids], dim=0)
-        attention_mask = torch.cat([prompt_mask, think_mask, answer_mask], dim=0)
-
-        # ---- 序列长度截断: 防止极长样本导致 NCCL 超时 ----
-        if self.max_seq_len > 0 and len(input_ids) > self.max_seq_len:
-            # 截断策略: 优先保留 prompt 和 answer，截断 think 块中间部分
+        # ---- 序列长度硬截断: 确保总长度 ≤ max_seq_len ----
+        # 策略: 绝不触碰 prompt (含图像 token) 和 answer, 只截断 think 块。
+        # 如果 prompt + answer 已经超限, 直接跳过该样本 (不截断 prompt, 避免 image token 不匹配)。
+        if self.max_seq_len > 0:
             prompt_len_val = len(prompt_ids)
             answer_len_val = len(answer_ids)
             max_think_len = self.max_seq_len - prompt_len_val - answer_len_val
-            if max_think_len > 0 and len(think_ids) > max_think_len:
-                # 截断 think 块 (保留前半段+后半段，使得 </step> 边界仍有一些)
+
+            if max_think_len <= 0:
+                # prompt + answer 已超 max_seq_len, 无法容纳任何 think 块
+                # 直接跳过, 不尝试截断 prompt (会破坏 image token 匹配)
+                raise _SampleTooLongError(
+                    f"prompt({prompt_len_val}) + answer({answer_len_val}) = "
+                    f"{prompt_len_val + answer_len_val} > max_seq_len {self.max_seq_len}, "
+                    f"无法容纳 think 块, 跳过样本"
+                )
+
+            if len(think_ids) > max_think_len:
+                # 截断 think 块: 保留前半段 + 后半段, 使 </step> 边界仍有一些
+                orig_think_len = len(think_ids)
                 half = max_think_len // 2
                 think_ids = torch.cat([think_ids[:half], think_ids[-half:]], dim=0)
                 think_mask = torch.cat([think_mask[:half], think_mask[-half:]], dim=0)
-                # 重新拼接
-                input_ids = torch.cat([prompt_ids, think_ids, answer_ids], dim=0)
-                attention_mask = torch.cat([prompt_mask, think_mask, answer_mask], dim=0)
-            elif max_think_len <= 0:
-                # 极端: prompt + answer 已超限，直接截断总序列
-                input_ids = input_ids[:self.max_seq_len]
-                attention_mask = attention_mask[:self.max_seq_len]
+                # 重映射 think_step_positions
+                new_positions = []
+                for pos in think_step_positions:
+                    if pos < half:
+                        new_positions.append(pos)
+                    elif pos >= orig_think_len - half:
+                        new_pos = half + (pos - (orig_think_len - half))
+                        if new_pos < max_think_len:
+                            new_positions.append(new_pos)
+                think_step_positions = new_positions
 
+        # 拼接完整序列 (此时保证 ≤ max_seq_len)
+        input_ids = torch.cat([prompt_ids, think_ids, answer_ids], dim=0)
+        attention_mask = torch.cat([prompt_mask, think_mask, answer_mask], dim=0)
 
+        # 断言: 硬性保证不超限
+        assert self.max_seq_len <= 0 or len(input_ids) <= self.max_seq_len, \
+            f"BUG: 截断后仍超限 {len(input_ids)} > {self.max_seq_len}"
 
         # Labels 策略 (分段监督):
         #   - prompt 部分: -100 (不参与 loss)
@@ -456,7 +554,6 @@ class RLDDataset(Dataset):
         think_chain_source = item.get('think_chain_source', 'fabricated')
         if think_chain_source in self.SUPERVISED_THINK_SOURCES:
             # 高质量推理链: think 块也参与 loss
-            # 为 Controller 提供密集梯度信号 (每个 token 位置都有梯度)
             think_labels = think_ids.clone()
         else:
             # 低质量/伪造: think 块不参与 loss
@@ -468,40 +565,15 @@ class RLDDataset(Dataset):
             answer_ids.clone(),                  # final answer: 监督 ✅
         ], dim=0)
 
-        # labels 也需要同步截断 (使用实际截断后的长度)
-        actual_length = len(input_ids)
-        if len(labels) > actual_length:
-            labels = labels[:actual_length]
-
         # pixel_values 和 image_grid_thw 不需要 squeeze batch 维
-        # 因为 collator 中会用 torch.cat 沿 dim=0 拼接
         pixel_values = prompt_inputs.get('pixel_values')
         image_grid_thw = prompt_inputs.get('image_grid_thw')
-        
-        # pixel_values: [num_patches, C] (已经没有 batch 维)
-        # image_grid_thw: [num_images, 3]
 
-        # 记录 prompt 长度 (用于 model.forward 中将 prompt 独立 prefill)
+        # 记录 prompt 长度
         prompt_len = len(prompt_ids)
 
-        # ---- 截断安全检查: image token 与 visual features 数量必须匹配 ----
-        # 截断后如果 image token 数量与 visual features 不一致，说明截断保护失效。
-        # 此时不能清除 pixel_values (会导致 ZeRO-3 下 ViT forward 路径不一致 → NCCL 死锁)。
-        # 安全做法: 完全不截断该样本 (恢复原始序列)，容忍可能的 OOM。
-        SPATIAL_MERGE_SIZE = 2   # Qwen3-VL 默认 spatial_merge_size
-        if pixel_values is not None and image_grid_thw is not None:
-            num_image_tokens = (input_ids == self.IMAGE_TOKEN_ID).sum().item()
-            num_image_features = (
-                image_grid_thw.prod(-1) // (SPATIAL_MERGE_SIZE ** 2)
-            ).sum().item()
-            if num_image_tokens != num_image_features:
-                # 截断保护失效，回退到不截断
-                input_ids = torch.cat([prompt_ids, think_ids, answer_ids], dim=0)
-                attention_mask = torch.cat([prompt_mask, think_mask, answer_mask], dim=0)
-                labels_prompt = torch.full_like(prompt_ids, -100)
-                labels_think = think_labels
-                labels_answer = answer_ids.clone()
-                labels = torch.cat([labels_prompt, labels_think, labels_answer], dim=0)
+        # 将 think_step_positions 转换为完整序列中的位置 (加上 prompt_len 偏移)
+        step_positions = [pos + prompt_len for pos in think_step_positions]
 
         return {
             "input_ids": input_ids,
@@ -511,6 +583,7 @@ class RLDDataset(Dataset):
             "image_grid_thw": image_grid_thw,
             "has_image": pixel_values is not None,
             "prompt_len": prompt_len,
+            "step_positions": step_positions,
         }
 
 
@@ -567,18 +640,14 @@ class RLDCollator:
             pad_offset = max_len - orig_len
             prompt_lens.append(pad_offset + item['prompt_len'])
 
-        # 检测 step boundaries (padding 后的位置，支持多 token delimiter)
+        # 使用 __getitem__ 中预计算的 step_positions (精确, 不受 BPE 合并影响)
+        # 只需加上 left-padding 偏移即可
         step_boundaries = []
-        delim = self.step_delimiter_ids
-        delim_len = len(delim)
-        for b in range(input_ids.shape[0]):
-            positions = []
-            seq = input_ids[b].tolist()
-            # 只在 prompt 之后搜索 delimiter (prompt 中不可能有 </step>)
-            search_start = max(prompt_lens[b], delim_len - 1)
-            for i in range(search_start, len(seq)):
-                if seq[i - delim_len + 1 : i + 1] == delim:
-                    positions.append(i)
+        for b_idx, item in enumerate(batch):
+            orig_len = len(item['input_ids'])
+            pad_offset = max_len - orig_len
+            # item['step_positions'] 是相对于原始序列的位置，加上 pad_offset 得到 padded 序列位置
+            positions = [pos + pad_offset for pos in item.get('step_positions', [])]
             step_boundaries.append(positions)
 
         return {

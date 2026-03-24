@@ -6,8 +6,11 @@ RLD 训练脚本
     # 单卡
     python scripts/train.py --config configs/rld_train.yaml
     
-    # 多卡 (DeepSpeed)
-    deepspeed --num_gpus=8 scripts/train.py --config configs/rld_train.yaml
+    # 多卡 (PyTorch DDP, 默认推荐)
+    torchrun --nproc_per_node=8 scripts/train.py --config configs/rld_train.yaml
+
+    # 多卡 (DeepSpeed ZeRO-2, 可选)
+    deepspeed --num_gpus=8 scripts/train.py --config configs/rld_train.yaml --use_deepspeed
 """
 
 import os
@@ -39,6 +42,8 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=None, help="覆盖学习率")
     parser.add_argument("--num_train_epochs", type=int, default=None, help="覆盖训练轮数")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="从 checkpoint 恢复")
+    parser.add_argument("--use_deepspeed", action="store_true", default=False,
+                        help="使用 DeepSpeed ZeRO-2 (默认使用 PyTorch DDP)")
     parser.add_argument("--local_rank", type=int, default=-1, help="DeepSpeed local rank")
     return parser.parse_args()
 
@@ -69,10 +74,42 @@ def main():
     set_seed(seed)
     is_main = _is_main_process()
 
+    # ====== 判断分布式后端 ======
+    # 优先级: 命令行 --use_deepspeed > yaml 中的 deepspeed_config
+    ds_config_path = None
+    if args.use_deepspeed:
+        # 命令行显式指定使用 DeepSpeed
+        ds_config_path = training_config.get('deepspeed_config', 'configs/ds_config_zero2.json')
+        if not os.path.exists(ds_config_path):
+            # 尝试备用路径
+            ds_config_path = os.path.join(os.path.dirname(args.config), 'ds_config_zero2.json')
+    elif training_config.get('deepspeed_config') and not training_config['deepspeed_config'].startswith('#'):
+        # yaml 中未注释的 deepspeed_config (向后兼容)
+        _yaml_ds = training_config['deepspeed_config']
+        if os.path.exists(_yaml_ds):
+            ds_config_path = _yaml_ds
+
+    use_deepspeed = ds_config_path is not None and os.path.exists(ds_config_path)
+
+    if is_main:
+        if use_deepspeed:
+            print(f"📦 分布式后端: DeepSpeed ZeRO-2 ({ds_config_path})")
+        else:
+            print(f"📦 分布式后端: PyTorch DDP (torchrun)")
+
     # ====== 1. 加载 Processor ======
     if is_main:
-        print("[1/5] 加载 Processor...")
+        print("\n[1/5] 加载 Processor...")
     processor = AutoProcessor.from_pretrained(model_config['model_path'])
+
+    # 限制图片分辨率: 避免 ViT 编码器处理超高分辨率图片 (默认 max_pixels=12845056 会导致
+    # vision encoder 单张图耗时 30~40s, 降到 ~1003520 后仅需 1~2s)
+    _min_pixels = data_config.get('min_pixels', 3136)
+    _max_pixels = data_config.get('max_pixels', 1003520)
+    processor.image_processor.min_pixels = _min_pixels
+    processor.image_processor.max_pixels = _max_pixels
+    if is_main:
+        print(f"  图片分辨率限制: min_pixels={_min_pixels}, max_pixels={_max_pixels}")
 
     # ====== 2. 创建数据集 ======
     if is_main:
@@ -108,9 +145,8 @@ def main():
         print("\n[3/5] 创建 RLD 模型...")
 
     # 检查是否使用 ZeRO-3 (用于打印参数统计等)
-    ds_config_path = training_config.get('deepspeed_config')
     use_zero3 = False
-    if ds_config_path and os.path.exists(ds_config_path):
+    if use_deepspeed and ds_config_path:
         with open(ds_config_path) as f:
             ds_cfg = json.load(f)
         zero_stage = ds_cfg.get('zero_optimization', {}).get('stage', 0)
@@ -191,7 +227,11 @@ def main():
         dataloader_num_workers=training_config.get('num_workers', 4),
         dataloader_pin_memory=True,
         remove_unused_columns=False,
-        deepspeed=training_config.get('deepspeed_config'),
+        # 分布式后端: DDP 或 DeepSpeed (由 --use_deepspeed 参数控制)
+        deepspeed=ds_config_path if use_deepspeed else None,
+        # DDP 配置: 冻结了 8.77B 基座参数，需要设置 find_unused_parameters=False
+        # (所有可训练参数都参与 forward, 不需要额外查找未使用参数)
+        ddp_find_unused_parameters=False,
         report_to=["tensorboard"],
         seed=seed,
         ddp_timeout=1800,  # DDP 超时 (默认)

@@ -132,6 +132,9 @@ class RLDInference:
         text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+        # 注意: 不在此处追加 "<think>\n"!
+        # model.py 的 generate() 方法会在 prefill 后自动 feed "<think>\n" token，
+        # 确保训推一致性由 model 层统一保证，调用方无需关心。
         if process_vision_info:
             image_inputs, _ = process_vision_info(messages)
         else:
@@ -158,12 +161,24 @@ class RLDInference:
         # 解码 (只取生成部分)
         prompt_len = inputs['input_ids'].shape[1]
         generated_tokens = generated_ids[0, prompt_len:]
-        answer = self.processor.tokenizer.decode(
-            generated_tokens, skip_special_tokens=True
+        full_output = self.processor.tokenizer.decode(
+            generated_tokens, skip_special_tokens=False
         )
 
-        # 清理 </step> delimiter
-        answer = answer.replace("</step>", "").strip()
+        # 后处理: 用 </think> 分割 CoT 和 final answer
+        # generated_ids 包含: [prompt | <think>\n | 生成内容]
+        # 生成内容的格式应为: "{think_steps}</think>\n\n{final_answer}<|im_end|>"
+        # 因此 full_output 解码后包含: "<think>\n{think_steps}</think>\n\n{final_answer}<|im_end|>"
+        if "</think>" in full_output:
+            think_part, answer_part = full_output.split("</think>", 1)
+            # CoT 部分: 清理 </step> 标记
+            cot = think_part.replace("</step>", " ").strip()
+            # Answer 部分: 清理特殊标记
+            answer = answer_part.replace("<|im_end|>", "").strip()
+        else:
+            # 异常情况: 模型未输出 </think>，整体视为 answer
+            answer = full_output.replace("<|im_end|>", "").replace("</step>", "").replace("<think>", "").strip()
+            cot = None
 
         return answer
 

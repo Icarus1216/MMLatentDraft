@@ -3,15 +3,9 @@
 #
 # 核心设计:
 #   - 冻结 Qwen3-VL 全部参数
-#   - 只训练 RLD Controller (< 25M 参数)
-#   - 通过 prefix embedding 注入影响自回归生成 (每段一次 forward)
+#   - 只训练 RLD Controller + ReadoutAdapter (< 30M 参数)
+#   - 通过 ReadoutAdapter 将 draft 注入 frozen hidden states
 #   - 在 </step> 边界触发 "回看-验证" 更新
-#
-# 8B Dense 优化:
-#   - hidden_states 不 detach: controller 获得双重梯度路径
-#   - 段1+ 合并双重 forward 为单次: forward 次数 N 段 = N 次
-#   - 移除 dummy 段对齐: ZeRO-2 不需要
-#   - EmbeddingProjector 全秩投影
 
 # 基座模型配置
 model:
@@ -35,14 +29,14 @@ rld:
   # (当前使用方案 A: Embedding 注入, prefix embedding 自然参与全层 attention)
   
   # 正则化
-  lambda_div: 0.01           # 多样性正则化权重 (防止草稿槽坍塌)
+  lambda_div: 0.1            # 多样性正则化权重 (配合 threshold=0.3 的余弦惩罚, 只惩罚 cosim>0.3 的部分)
 
 # 数据配置
 data:
   # 训练数据: JSON 格式
   # 每个样本: {"image": path, "question": text, "answer": text}
   # answer 中可以包含 </step> 作为步骤分隔符
-  train_json: "/mnt/cephszjt/user_juntianzhang/LatentDraft/data/rld_mmathcot_filtered_debug.json"
+  train_json: "/mnt/cephszjt/user_juntianzhang/LatentDraft/data/rld_mmathcot_filtered_checked.json"
   # eval_json: "/path/to/your/rld_val.json"   # 可选，暂未配置
   
   # 自动分步: 对于无 </step> 标注的数据，按句号/换行自动分段
@@ -52,8 +46,20 @@ data:
   # 可节省每次训练启动时 ~4 分钟的 IO 检查时间 (297K 样本 × 8 进程)
   skip_image_check: true
   
-  # 序列最大长度: 超过此长度的样本会被截断 (防止极长样本导致 NCCL 超时)
-  max_seq_len: 4096
+  # 图片分辨率限制: 控制 Qwen3-VL 动态分辨率的上限
+  # Qwen3-VL 默认 max_pixels=12845056 (≈3584×3584), 高分辨率图片会产生 3000~5000 个
+  # 视觉 token, 导致 ViT 编码器耗时 30~40s/张 (O(N²) self-attention)。
+  # 限制 max_pixels 可将 vision 耗时从 30~40s 降到 1~2s, 同时消除 rank 间耗时差异。
+  # | max_pixels | 约等于分辨率 | 视觉 token 数 | vision 耗时 |
+  # |  1003520   | ~1000×1000  |    ~600      |   1~2s  ✅  |
+  # |   501760   |  ~700×700   |    ~350      |   <1s   ✅  |
+  min_pixels: 3136           # 56×56 = 最小 1 个 patch
+  max_pixels: 1003520        # ≈1000×1000, 约 600 个视觉 token, vision 耗时 1~2s
+
+  # 序列最大长度: 超过此长度的样本会被截断/跳过 (防止 OOM 和 NCCL 超时)
+  # 注意: 限制 max_pixels 后视觉 token 数大幅减少 (~600), 留给 think+answer 的空间更充裕。
+  # 如果遇到 cudaErrorContained (NVLink 显存越界), 降低此值到 2048 或 1536。
+  max_seq_len: 2048
   
   # System Prompt: 在对话中注入分步推理指令
   # 训练和推理时统一使用，引导模型自主按 </step> 分步输出思维链
@@ -68,7 +74,7 @@ training:
   num_epochs: 1
   per_device_train_batch_size: 1     # Qwen3-VL-8B 显存压力更大，减小 batch size
   per_device_eval_batch_size: 1
-  gradient_accumulation_steps: 16    # 有效 batch_size = 1 * 16 * num_gpus
+  gradient_accumulation_steps: 4     # 有效 batch_size = 1 * 4 * num_gpus (从16降低以加速训练)
   
   # 学习率
   learning_rate: 1.0e-4              # 全局学习率 (TrainingArguments 需要)
@@ -89,8 +95,10 @@ training:
   # 数据加载
   num_workers: 4
   
-  # DeepSpeed ZeRO-2: 8B 模型使用 ZeRO-2 即可 (冻结模型参数不占优化器内存)
-  deepspeed_config: "configs/ds_config_zero2.json"
+  # 分布式后端: 默认使用 PyTorch DDP (torchrun)，通信简单高效
+  # 只需同步 61M 可训练参数的梯度 (1 次 allreduce)，显存开销几乎不变
+  # 如需使用 DeepSpeed ZeRO-2，在命令行添加 --use_deepspeed 参数即可启用
+  # deepspeed_config: "configs/ds_config_zero2.json"
   
   # 报告
   report_to: ["tensorboard"]

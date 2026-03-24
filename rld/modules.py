@@ -8,15 +8,25 @@ RLD 核心模块
 4. TraceUpdater: 累计式推理轨迹更新 (T_{c-1}, S_c) -> T_c (2层CA, 防止长链记忆退化)
 5. ReflectionModule: 回看-验证 (T_c, Z^e) -> G_c (2层CA, retrieval + verification)
 6. DraftUpdater: 用 G_c 更新可擦写草稿 Z^d, T_c 仅提供全局方向 bias
-7. EvidenceGate: 自适应证据门控，根据推理进度动态调节 Z_e 各 slot 的通过量
-8. EmbeddingProjector: 将 draft prefix 投影到 hidden_size 维度的 embedding 空间 (方案 A)
 """
 
+import os
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
+
+# 调试开关: 仅主进程 + RLD_DEBUG=1 时打印多层注入调试信息
+def _should_debug_print():
+    if os.environ.get('RLD_DEBUG', '0') != '1':
+        return False
+    import torch.distributed as dist
+    if dist.is_initialized():
+        return dist.get_rank() == 0
+    return int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '-1'))) in (-1, 0)
+
+_DEBUG_MULTILAYER = None  # 延迟初始化
 
 
 class RMSNorm(nn.Module):
@@ -163,8 +173,11 @@ hidden_size: int = 4096,
         # 从 hidden_size 投影到 d_z
         self.proj_v = nn.Linear(hidden_size, d_z, bias=False)
 
-        # 可学习的 evidence queries
-        self.evidence_queries = nn.Parameter(torch.randn(1, num_evidence_slots, d_z) * 0.02)
+        # 可学习的 evidence queries (正交初始化, 防止 Z_e 源头坍塌)
+        _eq_data = torch.empty(num_evidence_slots, d_z)
+        nn.init.orthogonal_(_eq_data)
+        _eq_data = _eq_data * (0.5 / _eq_data.norm(dim=-1, keepdim=True).clamp(min=1e-8))
+        self.evidence_queries = nn.Parameter(_eq_data.unsqueeze(0))  # [1, K_e, d_z]
 
         # Cross-attention 层
         self.layers = nn.ModuleList([
@@ -413,9 +426,6 @@ class DraftUpdater(nn.Module):
             nn.Linear(d_z * 4, d_z, bias=False),
         )
 
-        # 输出归一化
-        self.out_norm = RMSNorm(d_z)
-
         # 门控
         if use_gate:
             self.gate_proj = nn.Linear(d_z, 1, bias=True)
@@ -460,185 +470,20 @@ class DraftUpdater(nn.Module):
             # 门控: α_c = sigmoid(W_α · Pool(U_c))
             # 对每个 slot 独立计算门控
             alpha = torch.sigmoid(self.gate_proj(U_c))  # [B, K_d, 1]
-            Z_d_new = self.out_norm((1.0 - alpha) * Z_d + alpha * update)
+            # 注意: 不使用 RMSNorm, 因为归一化会把 slot 间的范数差异抹平, 加速坍塌
+            Z_d_new = (1.0 - alpha) * Z_d + alpha * update
         else:
-            Z_d_new = self.out_norm(Z_d + update)
+            Z_d_new = Z_d + update
+
+        # 软范数裁剪: 限制每个 slot 的最大范数, 防止多 step 累积后范数爆炸
+        # 但不做归一化 (保留 slot 间的范数差异, 避免坍塌)
+        max_norm = 35.0
+        slot_norms = Z_d_new.norm(dim=-1, keepdim=True).clamp(min=1e-8)  # [B, K_d, 1]
+        # 只裁剪超过 max_norm 的 slot, 其余不变
+        clamped_scale = (max_norm / slot_norms).clamp(max=1.0)
+        Z_d_new = Z_d_new * clamped_scale
 
         return Z_d_new
-
-
-class EvidenceGate(nn.Module):
-    """
-    自适应证据门控
-    
-    根据当前推理状态（Z_d 的全局摘要 + 推理步数）动态调节 Z_e 各 slot 的通过量。
-    
-    核心思想:
-    - 推理早期：β ≈ 0.9，Z_e 几乎全量通过（模型需要所有视觉证据）
-    - 推理后期：无用的 Z_e slot 的 β 学习降低，释放 attention budget
-    - 不同 slot 独立门控：模型可以选择性保留关键证据、衰减无关证据
-    
-    β = σ(GateNet([Z_d_mean; step_emb]))
-    Z_e' = β ⊙ Z_e
-    
-    初始化策略: bias = +2.2 使 σ(2.2) ≈ 0.9，初始时几乎全部通过
-    
-    设计动机:
-    - Z_e 在整个推理过程中冻结不变，但不同推理阶段对证据的需求不同
-    - 后期推理步骤中无用的 Z_e slot 会占用 attention budget（注意力稀释）
-    - 门控可以让模型自适应地衰减无关 slot，释放 attention 给真正需要的 token
-    - 被衰减到接近零的 slot，其位置编码不一致问题也随之消失
-    
-    Args:
-        d_z: controller 空间维度
-        num_evidence_slots: 证据槽数量 K_e
-        max_steps: 最大推理步数（用于步数嵌入）
-    """
-
-    def __init__(
-        self,
-        d_z: int = 512,
-        num_evidence_slots: int = 16,
-        max_steps: int = 32,
-    ):
-        super().__init__()
-        self.d_z = d_z
-        self.K_e = num_evidence_slots
-
-        # 步数嵌入 (positional encoding for step count)
-        self.step_embedding = nn.Embedding(max_steps + 1, d_z // 4)
-
-        # 门控网络: [Z_d_mean(d_z) + step_emb(d_z//4)] → K_e 个门控值
-        gate_input_dim = d_z + d_z // 4
-        self.gate_net = nn.Sequential(
-            nn.Linear(gate_input_dim, d_z // 4, bias=False),
-            nn.SiLU(),
-            nn.Linear(d_z // 4, num_evidence_slots, bias=True),
-        )
-
-        self._init_weights()
-
-    def _init_weights(self):
-        """初始化: bias = +2.2 使 sigmoid ≈ 0.9 (几乎全通过), 权重小范围初始化减少随机扰动"""
-        nn.init.constant_(self.gate_net[-1].bias, 2.2)
-        for m in self.gate_net.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.01)
-
-    def forward(
-        self,
-        Z_e: torch.Tensor,     # [B, K_e, d_z] 冻结证据
-        Z_d: torch.Tensor,     # [B, K_d, d_z] 当前草稿
-        step_count: int,        # 当前推理步数
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            Z_e: [B, K_e, d_z] 冻结证据
-            Z_d: [B, K_d, d_z] 当前草稿
-            step_count: int 当前推理步数
-        
-        Returns:
-            Z_e_gated: [B, K_e, d_z] 门控后的证据
-            beta: [B, K_e, 1] 门控值 (可用于监控/可视化)
-        """
-        B = Z_e.shape[0]
-        device = Z_e.device
-
-        # Z_d 的全局摘要
-        z_d_mean = Z_d.mean(dim=1)  # [B, d_z]
-
-        # 步数嵌入 (clamp 到 max_steps)
-        step_idx = torch.tensor(
-            min(step_count, self.step_embedding.num_embeddings - 1),
-            device=device,
-        )
-        step_emb = self.step_embedding(step_idx)  # [d_z//4]
-        step_emb = step_emb.unsqueeze(0).expand(B, -1)  # [B, d_z//4]
-
-        # 拼接上下文，并统一 dtype（step_embedding 输出 float32，需对齐到 gate_net 权重 dtype）
-        context = torch.cat([z_d_mean, step_emb], dim=-1)  # [B, d_z + d_z//4]
-        context = context.to(self.gate_net[0].weight.dtype)
-
-        # 计算门控
-        beta = torch.sigmoid(self.gate_net(context))  # [B, K_e]
-        beta = beta.unsqueeze(-1)  # [B, K_e, 1]
-
-        # 门控 Z_e
-        Z_e_gated = Z_e * beta
-
-        return Z_e_gated, beta
-
-
-class EmbeddingProjector(nn.Module):
-    """
-    Embedding 投影器: 将 draft prefix 投影到 hidden_size 维度的 embedding 空间
-    
-    核心思路 (方案 A - Embedding 注入):
-    将 Z^p = [Z^e; Z^d] ∈ R^{K_p × d_z} 投影到 hidden_size 维度，
-    作为「虚拟 prefix token 的 embedding」拼接到 inputs_embeds 前面。
-    整个 Transformer forward 会自然处理这些 prefix embedding，
-    梯度天然连通，无需 hook 覆盖 KV cache。
-    
-    优点:
-    1. 梯度自然连通: prefix embedding 参与整个 forward，CE Loss 梯度直达
-    2. 实现简洁: 无需 hook、无需手动展开 decoder 层
-    3. 兼容性好: 与 flash attention / mRoPE 天然兼容
-    
-    使用全秩投影 (不低秩分解)
-      prefix_embeds = RMSNorm(MLP(Z_p))
-      MLP: d_z → hidden_size (直接投影, 参数量约 ~2.1M)
-    
-    Args:
-        d_z: controller 空间维度 (512)
-        hidden_size: 基座模型隐藏维度 (4096 for Qwen3-VL-8B)
-    """
-
-    def __init__(
-        self,
-        d_z: int = 512,
-        hidden_size: int = 4096,
-    ):
-        super().__init__()
-        self.d_z = d_z
-        self.hidden_size = hidden_size
-
-        # 4B 优化: 全秩投影 (不再低秩分解)
-        # d_z(512) → hidden_size(2560), 参数量 = 512*2560 = 1.3M, 可忽略
-        self.proj = nn.Linear(d_z, hidden_size, bias=False)
-
-        # 归一化 (使输出尺度与基座 embedding 匹配)
-        self.out_norm = RMSNorm(hidden_size)
-
-        # 可学习的缩放因子 (初始化为小值，减少初始干扰)
-        self.scale = nn.Parameter(torch.tensor(0.1))
-
-        self._init_weights()
-
-    def _init_weights(self):
-        """小范围初始化，让初始注入对模型的干扰最小"""
-        nn.init.normal_(self.proj.weight, std=0.01)
-
-    def forward(
-        self,
-        Z_p: torch.Tensor,   # [B, K_p, d_z]
-    ) -> torch.Tensor:
-        """
-        将 draft prefix 投影到 hidden_size 维度
-        
-        Args:
-            Z_p: [B, K_p, d_z] draft prefix 表示 (= [Z^e; Z^d])
-        
-        Returns:
-            prefix_embeds: [B, K_p, hidden_size] 可直接拼接到 inputs_embeds 前面
-        """
-        # 统一 dtype（DeepSpeed ZeRO 下权重可能是 bf16，输入可能是 fp32）
-        Z_p = Z_p.to(self.proj.weight.dtype)
-
-        # 全秩投影: d_z → hidden_size
-        h = self.proj(Z_p)              # [B, K_p, hidden_size]
-        h = self.out_norm(h)             # [B, K_p, hidden_size]
-        h = h * self.scale               # 缩放，减少初始干扰
-        return h
 
 
 class DiversityRegularizer(nn.Module):
@@ -648,10 +493,10 @@ class DiversityRegularizer(nn.Module):
     L_div = Σ_{i≠j} max(0, cos(z_i, z_j) - δ)
     
     Args:
-        threshold: 相似度阈值 δ (默认 0.1)
+        threshold: 相似度阈值 δ (默认 0.3, 允许 slot 间有适度相似性)
     """
 
-    def __init__(self, threshold: float = 0.1):
+    def __init__(self, threshold: float = 0.3):
         super().__init__()
         self.threshold = threshold
 
@@ -663,7 +508,6 @@ class DiversityRegularizer(nn.Module):
         Returns:
             loss: 标量
         """
-        # 在 batch 维取均值
         B, K, D = Z.shape
         Z_norm = F.normalize(Z, p=2, dim=-1)  # [B, K, D]
 
@@ -671,12 +515,356 @@ class DiversityRegularizer(nn.Module):
         gram = torch.bmm(Z_norm, Z_norm.transpose(1, 2))
 
         # 提取 off-diagonal
-        # mask 需要 expand 到 [B, K, K] 以匹配 gram 的 batch 维度 (boolean indexing 不支持广播)
         mask = ~torch.eye(K, dtype=torch.bool, device=Z.device).unsqueeze(0).expand(B, -1, -1)
         offdiag = gram[mask].view(B, -1)  # [B, K*(K-1)]
 
-        # Hinge loss
-        penalty = torch.relu(offdiag.abs() - self.threshold)
-        loss = (penalty ** 2).mean()
+        # 带阈值的余弦相似度惩罚: 允许 slot 间有适度相似性 (< threshold)
+        # 只有超过阈值的部分才受惩罚, 避免过度正则化破坏模型表达能力
+        # 梯度: 2*(|cosim| - threshold) * sign(cosim), 比旧版 hinge 梯度更强
+        excess = (offdiag.abs() - self.threshold).clamp(min=0.0)
+        loss = (excess ** 2).mean()
 
         return loss
+
+
+class DraftReadoutAdapter(nn.Module):
+    """
+    Draft Readout Adapter (版本 A: 最稳、最简单)
+    
+    对每个 token 的 frozen hidden h_t，让它读当前 step 的 draft Z_d:
+      a_t = CrossAttn(Q=h_t, K=Z_d, V=Z_d)
+      h_t_adapted = h_t + scale * W_o(a_t)
+    
+    最后再过原来的 lm_head 得到 logits:
+      logits_t = lm_head(h_t_adapted)
+    
+    设计动机:
+    - Draft 通过 cross-attention 直接影响 token 分布
+    - 训练时只需要一次 base forward
+    - 没有 cache 改写、没有多次 forward
+    - Prefix-Tuning (Li & Liang, ACL 2021) 证明：小的连续适配器
+      可以强力调控冻结模型的输出
+    
+    Args:
+        hidden_size: 基座模型隐藏维度 (3584 for Qwen3-VL-8B)
+        d_z: controller 空间维度 (512)
+        num_heads: cross-attention 头数
+    """
+
+    def __init__(
+        self,
+        hidden_size: int = 3584,
+        d_z: int = 512,
+        num_heads: int = 8,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.d_z = d_z
+        self.num_heads = num_heads
+        self.head_dim = d_z // num_heads
+        assert d_z % num_heads == 0
+
+        # 将 hidden_size 的 h_t 投影到 d_z 空间作为 query
+        self.q_proj_down = nn.Linear(hidden_size, d_z, bias=False)
+
+        # Cross-attention: Q=h_t(d_z), KV=Z_d(d_z)
+        self.q_norm = RMSNorm(d_z)
+        self.kv_norm = RMSNorm(d_z)
+        self.q_proj = nn.Linear(d_z, d_z, bias=False)
+        self.k_proj = nn.Linear(d_z, d_z, bias=False)
+        self.v_proj = nn.Linear(d_z, d_z, bias=False)
+        self.o_proj = nn.Linear(d_z, d_z, bias=False)
+
+        # 将 cross-attention 输出从 d_z 投影回 hidden_size
+        self.out_proj_up = nn.Linear(d_z, hidden_size, bias=False)
+
+        # 输出归一化
+        self.out_norm = RMSNorm(hidden_size)
+
+        # 方案 A: 放大缩放因子初始值，避免三重投影链导致信号衰减过大
+        # 从 0.1 → 1.0，配合 std=0.02 使初始修正量从 ~10^{-7} 提升到 ~10^{-4}
+        self.scale = nn.Parameter(torch.tensor(1.0))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """方案 A: 放大初始化，确保梯度信号有效传播 (bf16 安全)"""
+        nn.init.normal_(self.q_proj_down.weight, std=0.02)
+        nn.init.normal_(self.out_proj_up.weight, std=0.02)
+        nn.init.normal_(self.o_proj.weight, std=0.02)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,  # [B, T, hidden_size] 冻结 base model 的 hidden
+        draft_states: torch.Tensor,    # [B, T, K_d, d_z] 每个 token 对应的 draft state
+    ) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: [B, T, hidden_size] — 冻结 base model 最后一层的 hidden
+            draft_states: [B, T, K_d, d_z] — 每个 token 位置对应的 step-level draft
+        
+        Returns:
+            adapted_hidden: [B, T, hidden_size] — 适配后的 hidden (可直接过 lm_head)
+        """
+        B, T, H = hidden_states.shape
+        K_d = draft_states.shape[2]
+        param_dtype = self.q_proj.weight.dtype
+
+        hidden_states = hidden_states.to(param_dtype)
+        draft_states = draft_states.to(param_dtype)
+
+        # 1. 投影 Q: [B, T, hidden_size] → [B, T, d_z]
+        q = self.q_proj_down(hidden_states)  # [B, T, d_z]
+
+        # 2. Pre-norm
+        q = self.q_norm(q)
+        # draft_states: [B, T, K_d, d_z] → reshape for batch cross-attention
+        # 将 B*T 作为 batch 维
+        q_flat = q.reshape(B * T, 1, self.d_z)  # [B*T, 1, d_z]
+        kv_flat = draft_states.reshape(B * T, K_d, self.d_z)  # [B*T, K_d, d_z]
+        kv_flat = self.kv_norm(kv_flat)
+
+        # 3. Q, K, V 投影
+        q_heads = self.q_proj(q_flat).view(B * T, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        k_heads = self.k_proj(kv_flat).view(B * T, K_d, self.num_heads, self.head_dim).transpose(1, 2)
+        v_heads = self.v_proj(kv_flat).view(B * T, K_d, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # 4. Scaled Dot-Product Attention
+        scale = math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(q_heads, k_heads.transpose(-2, -1)) / scale
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q_heads.dtype)
+        attn_output = torch.matmul(attn_weights, v_heads)  # [B*T, num_heads, 1, head_dim]
+
+        # 5. 合并头并投影
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B * T, 1, self.d_z)
+        attn_output = self.o_proj(attn_output)  # [B*T, 1, d_z]
+        attn_output = attn_output.view(B, T, self.d_z)  # [B, T, d_z]
+
+        # 6. 投影回 hidden_size 并残差连接
+        adaptation = self.out_proj_up(attn_output)  # [B, T, hidden_size]
+        adaptation = self.out_norm(adaptation)
+        adapted_hidden = hidden_states + self.scale * adaptation
+
+        return adapted_hidden
+
+
+class MultiLayerDraftReadout(nn.Module):
+    """
+    多层 Draft Readout (方案 A+C)
+    
+    在多个 Transformer 中间层 + 最后一层分别放置 DraftReadoutAdapter，
+    将各层的修正量叠加到最终 hidden states 上。
+    
+    设计动机:
+    - 单层 readout 只在最后一层做修正，对中间表示没有引导能力
+    - 多层 readout 从不同深度的 hidden states 提取信息，提供更丰富的梯度路径
+    - 浅层 adapter 的 scale 更小 (渐进式影响)，避免初始干扰叠加过大
+    - 仍然只需一次 base model forward (output_hidden_states=True)
+    
+    默认选取层索引: [L//4, L//2, 3L//4, L-1]
+    对于 36 层模型: [9, 18, 27, 35]
+    
+    Args:
+        hidden_size: 基座模型隐藏维度
+        d_z: controller 空间维度
+        num_heads: cross-attention 头数
+        total_layers: 基座模型总层数
+        readout_layer_indices: 要放置 readout adapter 的层索引列表
+                               如果为 None，自动选取 [L//4, L//2, 3L//4, L-1]
+    """
+
+    def __init__(
+        self,
+        hidden_size: int = 3584,
+        d_z: int = 512,
+        num_heads: int = 8,
+        total_layers: int = 36,
+        readout_layer_indices: list = None,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.d_z = d_z
+        self.total_layers = total_layers
+
+        # 确定要放置 readout adapter 的层索引
+        if readout_layer_indices is None:
+            self.layer_indices = [
+                total_layers // 4,      # 浅层 (第 9 层)
+                total_layers // 2,      # 中层 (第 18 层)
+                3 * total_layers // 4,  # 深层 (第 27 层)
+                total_layers - 1,       # 最后一层 (第 35 层)
+            ]
+        else:
+            self.layer_indices = sorted(readout_layer_indices)
+
+        self.num_readout_layers = len(self.layer_indices)
+
+        # 为每个层创建独立的 DraftReadoutAdapter
+        self.adapters = nn.ModuleList([
+            DraftReadoutAdapter(
+                hidden_size=hidden_size,
+                d_z=d_z,
+                num_heads=num_heads,
+            )
+            for _ in range(self.num_readout_layers)
+        ])
+
+        # 渐进式 scale 初始化: 浅层小、深层大
+        # 例如 4 层: [0.1, 0.3, 0.5, 1.0]
+        scale_values = self._compute_progressive_scales()
+        for i, adapter in enumerate(self.adapters):
+            adapter.scale = nn.Parameter(torch.tensor(scale_values[i]))
+
+    def _compute_progressive_scales(self) -> list:
+        """
+        计算渐进式 scale 初始值
+        
+        浅层的 hidden states 语义信息不如深层丰富，给较小的 scale；
+        深层（最后一层）给最大的 scale。
+        
+        策略: 线性递增，从 0.1 到 1.0
+        """
+        n = self.num_readout_layers
+        if n == 1:
+            return [1.0]
+        # 线性插值: 0.1, ..., 1.0
+        return [0.1 + 0.9 * i / (n - 1) for i in range(n)]
+
+    @property
+    def scale(self):
+        """返回最后一层 adapter 的 scale (兼容旧接口的监控代码)"""
+        return self.adapters[-1].scale
+
+    def forward(
+        self,
+        all_hidden_states: tuple,       # tuple of [B, T, hidden_size], 来自 output_hidden_states=True
+        last_hidden_state: torch.Tensor, # [B, T, hidden_size], 最后一层的 hidden states
+        draft_states: torch.Tensor,      # [B, T, K_d, d_z] 每个 token 对应的 draft state
+    ) -> torch.Tensor:
+        """
+        多层 readout: 从各层提取修正量并叠加到最后一层的 hidden states 上
+        
+        公式:
+            adapted_hidden = h_L + Σ_l adapter_l(h_l, Z_d)
+        
+        注意: 每个 adapter 内部已经包含了 scale * adaptation 的计算，
+        这里的叠加是在 hidden_size 空间上的残差叠加。
+        
+        Args:
+            all_hidden_states: tuple of [B, T, H], Transformer 各层的 hidden states
+                               索引 0 是 embedding 层输出, 索引 1~L 是各 decoder 层输出
+            last_hidden_state: [B, T, H], 最后一层 hidden (= all_hidden_states[-1])
+            draft_states: [B, T, K_d, d_z] token 级 draft state
+        
+        Returns:
+            adapted_hidden: [B, T, hidden_size] 适配后的 hidden
+        """
+        B, T, H = last_hidden_state.shape
+        param_dtype = self.adapters[0].q_proj.weight.dtype
+        adapted_hidden = last_hidden_state.to(param_dtype)
+
+        # 调试: 延迟初始化 + 计数器控制打印频率
+        global _DEBUG_MULTILAYER
+        if _DEBUG_MULTILAYER is None:
+            _DEBUG_MULTILAYER = _should_debug_print()
+        if not hasattr(self, '_debug_fwd_count'):
+            self._debug_fwd_count = 0
+        self._debug_fwd_count += 1
+        _do_print = _DEBUG_MULTILAYER and (self._debug_fwd_count <= 3 or self._debug_fwd_count % 50 == 0)
+
+        if _do_print:
+            print("\n" + "─" * 70)
+            print(f"🔍 [MultiLayerDraftReadout] forward #{self._debug_fwd_count}")
+            print(f"   输入: last_hidden_state={list(last_hidden_state.shape)}, "
+                  f"draft_states={list(draft_states.shape)}")
+            print(f"   Readout 层索引: {self.layer_indices} (共 {self.num_readout_layers} 层)")
+            _original_norm = last_hidden_state.detach().float().norm(dim=-1).mean().item()
+            print(f"   原始 hidden L2 范数均值: {_original_norm:.4f}")
+
+        _layer_debug_info = []  # 收集每层的调试信息
+
+        for i, (layer_idx, adapter) in enumerate(zip(self.layer_indices, self.adapters)):
+            # all_hidden_states 的索引: 0=embedding, 1=layer0, ..., L=layerL-1
+            # 所以 layer_idx 对应 all_hidden_states[layer_idx + 1]
+            h_l = all_hidden_states[layer_idx + 1]  # [B, T, H]
+
+            if layer_idx == self.total_layers - 1:
+                # 最后一层: adapter 内部做 h + scale * adaptation
+                # 但我们需要的是纯 adaptation (不含原始 h)
+                # 因为 adapted_hidden 已经是 last_hidden_state 了
+                adaptation_l = adapter(h_l, draft_states) - h_l.to(param_dtype)
+            else:
+                # 中间层: adapter 返回 h_l + scale * adaptation
+                # 我们只需要 scale * adaptation 部分
+                adaptation_l = adapter(h_l, draft_states) - h_l.to(param_dtype)
+
+            adapted_hidden = adapted_hidden + adaptation_l
+
+            # 收集每层调试信息 (detach, 不影响梯度)
+            if _do_print:
+                with torch.no_grad():
+                    _adapt_norm = adaptation_l.detach().float().norm(dim=-1).mean().item()
+                    _h_l_norm = h_l.detach().float().norm(dim=-1).mean().item()
+                    _scale_val = adapter.scale.detach().item()
+                    _ratio = _adapt_norm / max(_original_norm, 1e-8)
+                    _layer_debug_info.append({
+                        'layer_idx': layer_idx,
+                        'scale': _scale_val,
+                        'h_l_norm': _h_l_norm,
+                        'adaptation_norm': _adapt_norm,
+                        'ratio_to_original': _ratio,
+                    })
+
+        if _do_print:
+            _total_adapt_norm = (adapted_hidden - last_hidden_state.to(param_dtype)).detach().float().norm(dim=-1).mean().item()
+            print(f"\n   📊 各层 Adapter 注入详情:")
+            _hdr = "   %6s | %8s | %10s | %12s | %12s" % ("层索引", "scale", "h_l范数", "修正量范数", "修正/原始比")
+            print(_hdr)
+            _sep = "   " + "─" * 6 + " | " + "─" * 8 + " | " + "─" * 10 + " | " + "─" * 12 + " | " + "─" * 12
+            print(_sep)
+            for info in _layer_debug_info:
+                print(f"   L{info['layer_idx']:>4d} | {info['scale']:>8.4f} | {info['h_l_norm']:>10.4f} | "
+                      f"{info['adaptation_norm']:>12.6f} | {info['ratio_to_original']:>12.6f}")
+            print(_sep)
+            print(f"   总修正量 L2 范数均值: {_total_adapt_norm:.6f}")
+            print(f"   总修正/原始比: {_total_adapt_norm / max(_original_norm, 1e-8):.6f}")
+            # 验证修正量非零 (证明 draft 确实在影响 CoT)
+            if _total_adapt_norm > 1e-8:
+                print("   ✅ 多层 Draft 注入生效: 修正量非零, 正在影响 CoT 推理")
+            else:
+                print("   ⚠️ 多层 Draft 注入量极小, 可能尚未学到有效修正")
+            # 检查层间修正量的差异性 (证明不同层确实提供了不同的信息)
+            if len(_layer_debug_info) > 1:
+                norms = [info['adaptation_norm'] for info in _layer_debug_info]
+                _norm_std = (sum((n - sum(norms)/len(norms))**2 for n in norms) / len(norms)) ** 0.5
+                _diversity_tag = "✅ 各层差异化" if _norm_std > 1e-6 else "⚠️ 各层同质化"
+                print(f"   层间修正量标准差: {_norm_std:.6f} ({_diversity_tag})")
+            print("   " + "─" * 70)
+
+        return adapted_hidden
+
+    def forward_single_token(
+        self,
+        hidden_states: torch.Tensor,  # [B, 1, hidden_size] 当前 token 的最后一层 hidden
+        draft_states: torch.Tensor,    # [B, 1, K_d, d_z] 当前 token 的 draft state
+    ) -> torch.Tensor:
+        """
+        推理时的单 token readout (仅使用最后一层 adapter)
+        
+        推理时无法获取中间层 hidden states (KV cache 模式下不保存)，
+        因此退化为只使用最后一层的 readout adapter。
+        
+        这是合理的近似:
+        - 训练时多层 readout 主要帮助梯度传播和参数学习
+        - 推理时最后一层的 adapter 已经从训练中学到了足够的调制能力
+        - 中间层 adapter 的 scale 较小，缺失的影响有限
+        
+        Args:
+            hidden_states: [B, 1, H] 最后一层的 hidden
+            draft_states: [B, 1, K_d, d_z] draft state
+        
+        Returns:
+            adapted_hidden: [B, 1, H]
+        """
+        # 使用最后一层的 adapter (scale 最大，影响最显著)
+        return self.adapters[-1](hidden_states, draft_states)

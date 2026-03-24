@@ -6,23 +6,21 @@ RLD Controller: 编排整个 Reflective Latent Draft 的生命周期
 2. Step 边界更新: 执行 S_c → T_c → G_c → Z^d_c 的完整更新链路
    - T_c 只用于计算 G_c 和提供全局方向 bias，不再作为 DraftUpdater 的 KV
    - TraceUpdater 和 ReflectionModule 均采用 2 层 CA
-3. KV Prefix 生成: 将 [Z_e_gated; Z^d_c] 投影到 embedding 空间
-   - Z_e 经过 EvidenceGate 自适应门控，根据推理进度动态调节各 slot 的通过量
-   - 推理早期 β ≈ 0.9 (几乎全通过)，后期无用 slot 自动衰减
+3. Draft 通过 ReadoutAdapter 注入 frozen hidden states
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, Tuple, List, Dict
 
 from .modules import (
+    CrossAttentionBlock,
     EvidenceResampler,
     StepResampler,
     TraceUpdater,
     ReflectionModule,
     DraftUpdater,
-    EvidenceGate,
-    EmbeddingProjector,
     DiversityRegularizer,
     RMSNorm,
 )
@@ -69,7 +67,6 @@ class RLDController(nn.Module):
         self.K_e = num_evidence_slots
         self.K_d = num_draft_slots
         self.K_t = num_trace_slots
-        self.K_p = num_evidence_slots + num_draft_slots  # prefix 总长度
         self.total_layers = total_layers
         self.lambda_div = lambda_div
 
@@ -114,36 +111,24 @@ class RLDController(nn.Module):
             use_gate=use_gate,
         )
 
-        # 6. 自适应证据门控: 根据推理进度动态调节 Z_e 各 slot 的通过量
-        # 初始 β ≈ 0.9 (几乎全通过)，推理后期自动衰减无用的 Z_e slot
-        self.evidence_gate = EvidenceGate(
-            d_z=d_z,
-            num_evidence_slots=num_evidence_slots,
-            max_steps=32,
-        )
-
-        # 7. Embedding 投影器: Z^p → prefix embeddings (方案 A)
-        # 将 [Z_e_gated; Z^d] 投影到 hidden_size 维度，作为虚拟 prefix token embedding
-        # 梯度自然连通，无需 hook 覆盖 KV cache
-        self.embedding_projector = EmbeddingProjector(
-            d_z=d_z,
-            hidden_size=hidden_size,
-
-        )
-
         # ====== 初始化相关 ======
 
-        # 可学习的草稿初始状态 (会在 prefill 时被条件化)
-        self.draft_init = nn.Parameter(torch.randn(1, num_draft_slots, d_z) * 0.02)
+        # 可学习的草稿初始状态 (正交初始化, 保证 slot 间余弦相似度 ≈ 0)
+        _draft_init_data = torch.empty(num_draft_slots, d_z)
+        nn.init.orthogonal_(_draft_init_data)
+        # 缩放范数到与 Z_e 同量级 (~1.0), 保证残差连接后正交差异不被 CA 共同分量淹没
+        self.draft_init = nn.Parameter(_draft_init_data.unsqueeze(0))  # [1, K_d, d_z], 每行范数≈1.0
 
-        # 草稿初始条件化: 用证据 Z^e 条件化初始草稿
-        self.draft_init_ca = nn.Sequential(
-            RMSNorm(d_z),
-            nn.Linear(d_z, d_z, bias=False),
+        # Per-slot 草稿条件化: 每个 draft slot 通过 cross-attention 从 Z_e 获取独立信息
+        # (替代旧版的 Z_e.mean 广播, 消除 slot 坍塌的根因)
+        self.draft_init_ca = CrossAttentionBlock(
+            d_model=d_z,
+            num_heads=num_heads,
+            mlp_ratio=4.0,
         )
 
-        # 多样性正则化
-        self.diversity_reg = DiversityRegularizer(threshold=0.1)
+        # 多样性正则化 (threshold=0.3: 允许 slot 间有适度相似性, 避免过度正则化)
+        self.diversity_reg = DiversityRegularizer(threshold=0.3)
 
     def prefill(
         self,
@@ -170,11 +155,11 @@ class RLDController(nn.Module):
         # 1. 生成冻结证据
         Z_e = self.evidence_resampler(visual_tokens)  # [B, K_e, d_z]
 
-        # 2. 初始化草稿 (用证据条件化)
+        # 2. 初始化草稿 (per-slot 条件化: 每个 slot 从 Z_e 获取独立信息)
         draft_init = self.draft_init.expand(B, -1, -1).to(device=device, dtype=dtype)
-        # 用 Z_e 的 mean pooled 向量给初始草稿加偏置
-        evidence_ctx = self.draft_init_ca(Z_e.mean(dim=1, keepdim=True))  # [B, 1, d_z]
-        Z_d = draft_init + evidence_ctx.expand_as(draft_init)
+        # Per-slot cross-attention: Q=draft_init (正交), KV=Z_e
+        # 每个 draft slot 的 query 向量不同 → attention 分布不同 → 获取不同的证据信息
+        Z_d = self.draft_init_ca(query=draft_init, key_value=Z_e)  # [B, K_d, d_z]
 
         # 3. 初始化轨迹为零
         T = torch.zeros(B, self.K_t, self.d_z, device=device, dtype=dtype)
@@ -237,44 +222,91 @@ class RLDController(nn.Module):
             Z_d_new = mask * Z_d_new + (1.0 - mask) * Z_d
             T_c = mask * T_c + (1.0 - mask) * T_prev
 
-        return {
+        new_state = {
             'Z_e': Z_e,  # 不变
             'Z_d': Z_d_new,
             'T': T_c,
             'step_count': state['step_count'] + 1,
         }
 
-    def get_prefix_embeds(
+        # ====== 监控指标 (detach，不影响梯度) ======
+        with torch.no_grad():
+            # Z_d 段间变化率
+            Zd_delta = (Z_d_new.detach() - Z_d.detach()).norm(dim=-1).mean()
+            Zd_base = Z_d.detach().norm(dim=-1).mean().clamp(min=1e-8)
+            new_state['_monitor'] = {
+                'Zd_abs_delta': Zd_delta.item(),
+                'Zd_relative_delta': (Zd_delta / Zd_base).item(),
+                # Z_d 槽间余弦相似度 (反映是否坍塌)
+                'Zd_slot_cosim': self._slot_cosine_similarity(Z_d_new.detach()),
+                # Z_d 有效秩 (反映表达多样性)
+                'Zd_effective_rank': self._effective_rank(Z_d_new.detach()),
+                # T 轨迹有效秩
+                'T_effective_rank': self._effective_rank(T_c.detach()),
+                # Z_d 槽的 L2 范数均值 (反映 draft 信号强度)
+                'Zd_norm': Z_d_new.detach().norm(dim=-1).mean().item(),
+            }
+
+        return new_state
+
+    def scan_steps(
         self,
         state: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
+        step_summaries: List[torch.Tensor],  # list of [B, K_t, d_z], 长度 = C
+        update_masks: List[torch.Tensor],    # list of [B] bool, 长度 = C
+    ) -> Tuple[Dict[str, torch.Tensor], List[torch.Tensor]]:
         """
-        生成 prefix embeddings (方案 A - Embedding 注入 + 自适应证据门控)
+        沿 step 维度扫描: 固定步数循环得到所有 step 的 Z_d_c
         
-        将 [Z_e_gated; Z^d] 投影到 hidden_size 维度，作为虚拟 prefix token 的 embedding。
-        其中 Z_e_gated = β ⊙ Z_e，β 由 EvidenceGate 根据当前推理进度动态计算。
-        
-        这些 embedding 直接拼接到 inputs_embeds 前面，参与完整的 Transformer forward，
-        梯度自然连通，无需 hook 覆盖 KV cache。
+        这是重构的核心方法: 将 step_update 从散落在段循环里改为一个独立的 for 循环。
+        所有 rank 执行相同次数 (C_max)，用 update_mask pad 保证跨 rank 一致。
         
         Args:
-            state: RLD 状态字典
+            state: 初始 RLD 状态 (来自 prefill)
+            step_summaries: list of [B, K_t, d_z], 每个 step 的摘要 S_c
+            update_masks: list of [B] bool, 每个 step 的 per-sample 更新掩码
         
         Returns:
-            prefix_embeds: [B, K_p, hidden_size] 可直接拼接到 inputs_embeds 前面
+            final_state: 最终的 RLD 状态
+            all_Z_d: list of [B, K_d, d_z], 每个 step 结束后的 draft state
+                      长度 = C + 1 (包含初始 Z_d_0)
         """
-        Z_e = state['Z_e']
-        Z_d = state['Z_d']
-        step_count = state['step_count']
+        all_Z_d = [state['Z_d']]  # 初始 Z_d_0
 
-        # 自适应证据门控: 根据推理进度调节 Z_e 各 slot 的通过量
-        Z_e_gated, _beta = self.evidence_gate(Z_e, Z_d, step_count)
+        for c in range(len(step_summaries)):
+            S_c = step_summaries[c]
+            mask = update_masks[c]
 
-        # 拼接 prefix: [Z_e_gated; Z^d]
-        Z_p = torch.cat([Z_e_gated, Z_d], dim=1)  # [B, K_e + K_d, d_z]
+            # 复用 step_update 的核心逻辑
+            Z_e = state['Z_e']
+            Z_d = state['Z_d']
+            T_prev = state['T']
 
-        # 投影到 hidden_size 维度
-        return self.embedding_projector(Z_p)  # [B, K_p, hidden_size]
+            # 1. 累计轨迹更新 (2层CA): [T_{c-1}; S_c] → T_c
+            T_c = self.trace_updater(T_prev, S_c)
+
+            # 2. 回看-验证 (2层CA): (T_c, Z^e) → G_c
+            G_c = self.reflection(T_c, Z_e)
+
+            # 3. 草稿更新: KV=G_c, T_c 仅提供全局方向 bias
+            Z_d_new = self.draft_updater(Z_d, T_c, G_c)
+
+            # 4. 根据 update_mask 选择性更新
+            if mask is not None:
+                float_mask = mask.float().unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
+                Z_d_new = float_mask * Z_d_new + (1.0 - float_mask) * Z_d
+                T_c = float_mask * T_c + (1.0 - float_mask) * T_prev
+
+            state = {
+                'Z_e': Z_e,
+                'Z_d': Z_d_new,
+                'T': T_c,
+                'step_count': state['step_count'] + 1,
+            }
+
+            all_Z_d.append(Z_d_new)
+
+        return state, all_Z_d
 
     def compute_diversity_loss(
         self,
@@ -283,11 +315,102 @@ class RLDController(nn.Module):
         """
         计算多样性正则化损失
         
-        对 Z^d 和轨迹 queries 进行去相关正则化
+        同时对 Z^d 和 Z^e 进行去相关正则化:
+        - Z_e 是坍塌的源头，必须从源头治理
+        - Z_d 是直接被使用的 slot，也需要正则化
         """
         Z_d = state['Z_d']
-        loss = self.diversity_reg(Z_d) * self.lambda_div
+        Z_e = state['Z_e']
+        # Z_d 和 Z_e 各占一半权重
+        loss_d = self.diversity_reg(Z_d)
+        loss_e = self.diversity_reg(Z_e)
+        loss = (loss_d + loss_e) * self.lambda_div
         return loss
+
+    @torch.no_grad()
+    def compute_draft_metrics(
+        self,
+        state: Dict[str, torch.Tensor],
+    ) -> Dict[str, float]:
+        """
+        计算 draft 状态的综合监控指标
+        
+        Args:
+            state: 当前 RLD 状态
+        
+        Returns:
+            metrics: 指标字典 (所有值都是 float，已 detach)
+        """
+        metrics = {}
+        Z_d = state['Z_d'].detach()
+        Z_e = state['Z_e'].detach()
+
+        # 1. Z_d 有效秩
+        metrics['draft/Zd_effective_rank'] = self._effective_rank(Z_d)
+
+        # 2. Z_d 槽间余弦相似度 (越低越好，高表示坍塌)
+        metrics['draft/Zd_slot_cosim'] = self._slot_cosine_similarity(Z_d)
+
+        # 3. Z_d L2 范数
+        metrics['draft/Zd_norm'] = Z_d.norm(dim=-1).mean().item()
+
+        # 4. Z_e 有效秩
+        metrics['draft/Ze_effective_rank'] = self._effective_rank(Z_e)
+
+        # 5. step_update 中收集的指标
+        if '_monitor' in state:
+            mon = state['_monitor']
+            metrics['draft/Zd_abs_delta'] = mon['Zd_abs_delta']
+            metrics['draft/Zd_relative_delta'] = mon['Zd_relative_delta']
+
+        # 6. step_count
+        metrics['draft/step_count'] = float(state['step_count'])
+
+        return metrics
+
+    @torch.no_grad()
+    def _slot_cosine_similarity(self, Z: torch.Tensor) -> float:
+        """
+        计算 Z 各 slot 之间的平均余弦相似度 (off-diagonal)
+        Z: [B, K, d_z]
+        返回: 平均余弦相似度 (标量)
+        """
+        Z_norm = F.normalize(Z, p=2, dim=-1)  # [B, K, d_z]
+        # gram: [B, K, K]
+        gram = torch.bmm(Z_norm, Z_norm.transpose(1, 2))
+        K = Z.shape[1]
+        mask = ~torch.eye(K, dtype=torch.bool, device=Z.device).unsqueeze(0)
+        offdiag = gram[mask.expand_as(gram)].view(Z.shape[0], -1)
+        return offdiag.abs().mean().item()
+
+    @torch.no_grad()
+    def _effective_rank(self, Z: torch.Tensor) -> float:
+        """
+        计算 Z 的有效秩 (基于归一化奇异值的香农熵)
+        Z: [B, K, d_z]
+        
+        有效秩 = exp(-Σ p_i * log(p_i))
+        其中 p_i = σ_i / Σ σ_j 是归一化的奇异值分布
+        
+        有效秩越高 → 信息利用的维度越多 → 表达越丰富
+        有效秩 ≈ 1 → 所有 slot 坍塌到一条线上
+        有效秩 ≈ K → 所有 slot 完全独立
+        """
+        # 对 batch 取平均 Z_mean: [K, d_z]
+        Z_mean = Z.float().mean(dim=0)  # [K, d_z]
+        # SVD
+        try:
+            _, S, _ = torch.svd(Z_mean)  # S: [min(K, d_z)]
+            # 归一化
+            S = S / S.sum().clamp(min=1e-8)
+            # 过滤零值
+            S = S[S > 1e-8]
+            # 香农熵
+            entropy = -(S * S.log()).sum()
+            effective_rank = entropy.exp().item()
+        except Exception:
+            effective_rank = 0.0
+        return effective_rank
 
     def get_num_trainable_params(self) -> int:
         """返回可训练参数总数"""

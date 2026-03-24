@@ -16,8 +16,8 @@ from .modules import (
     TraceUpdater,
     ReflectionModule,
     DraftUpdater,
-    EvidenceGate,
-    EmbeddingProjector,
+    DraftReadoutAdapter,
+    MultiLayerDraftReadout,
 )
 from .controller import RLDController
 from .model import RLDModel

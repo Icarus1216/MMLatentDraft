@@ -1,5 +1,6 @@
 #!/bin/bash
 # RLD (Reflective Latent Draft) 训练启动脚本
+# 默认使用 PyTorch DDP (torchrun), 如需使用 DeepSpeed 请设置: USE_DEEPSPEED=1
 set -e
 
 echo "🚀 RLD 训练启动"
@@ -32,14 +33,31 @@ echo "GPU 数量: $GPU_COUNT"
 echo ""
 
 # NCCL 配置
-export NCCL_DEBUG=WARN             # NCCL 日志级别
+export NCCL_DEBUG=WARN
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export TORCH_NCCL_TRACE_BUFFER_SIZE=1000  # 启用 FlightRecorder 便于调试
 
-# 注意力实现切换 (flash_attention_2 / sdpa / eager)
-# 默认使用 flash_attention_2 (最快)，如需切换可设置环境变量:
+# NVLink P2P: 已通过 max_seq_len=2048 严格截断解决 OOM/cudaErrorContained
+# 如果再次出现 peer memory 越界, 取消注释下行禁用 P2P:
+# export NCCL_P2P_DISABLE=1
+
+# CUDA 同步调试: 让 CUDA 操作同步执行，精确定位异步错误
+# 调试完成后注释掉此行恢复性能
+# export CUDA_LAUNCH_BLOCKING=1
+
+# PyTorch 显存管理: 启用 expandable_segments 减少碎片化
+# 方案三每段 forward 中 DynamicLayer.update() 的 torch.cat 会创建大量临时 tensor,
+# expandable_segments 让 allocator 以更大块分配/释放, 减少碎片
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# RLD 调试日志 (开启段循环详细日志 + 每段显存监控)
+# ⚠️ 调试模式会导致 rank 0 有额外的 lm_head 计算 + 大量打印, 增加 rank 间延迟
+# 稳定运行后建议关闭 (注释下行), 只保留 TensorBoard 指标监控
+# export RLD_DEBUG=1
+export RLD_DEBUG=0
+
+# 注意力实现: 使用 flash_attention_2 (性能最优)
+# 如果 flash-attn 有兼容性问题, 可切换到 sdpa:
 #   export RLD_ATTN_IMPL=sdpa
-#   export RLD_ATTN_IMPL=eager
 
 # 创建输出目录
 mkdir -p outputs/rld_train
@@ -61,10 +79,24 @@ else
     echo ""
 fi
 
+# 分布式后端选择:
+#   默认: torchrun (PyTorch DDP) — 通信简单, 只需 1 次 allreduce 同步 61M 可训练参数
+#   可选: DeepSpeed ZeRO-2 — 设置 USE_DEEPSPEED=1 启用 (显存不是瓶颈时不推荐)
+# export USE_DEEPSPEED=1
+
 # 启动训练
-deepspeed --num_gpus=$GPU_COUNT \
-    scripts/train.py \
-    --config configs/rld_train.yaml
+if [ "${USE_DEEPSPEED:-0}" = "1" ]; then
+    echo "📦 使用 DeepSpeed ZeRO-2 启动训练..."
+    deepspeed --num_gpus=$GPU_COUNT \
+        scripts/train.py \
+        --config configs/rld_train.yaml \
+        --use_deepspeed
+else
+    echo "📦 使用 PyTorch DDP (torchrun) 启动训练..."
+    torchrun --nproc_per_node=$GPU_COUNT \
+        scripts/train.py \
+        --config configs/rld_train.yaml
+fi
 
 echo ""
 echo "✅ 训练完成！"

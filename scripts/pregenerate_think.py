@@ -92,18 +92,23 @@ from PIL import Image
 # ============================================================
 
 # Stage 1: 自由推理 (与训练时的 RLD_SYSTEM_PROMPT 完全一致)
-# Qwen3-VL 的 thinking 模式是内建的，apply_chat_template 会自动输出 <think>\n，
-# 因此 system prompt 不需要教模型 <think>/<\/think> 格式，只需教 </step> 分步规范。
-FREE_REASONING_SYSTEM_PROMPT = """You are a visual reasoning assistant. When thinking through problems, break your reasoning into clear steps separated by </step>.
+# 显式要求模型: 1) 用 <think></think> 包裹思维链  2) 用 </step> 分步
+# 3) </think> 后输出最终答案。保持训推一致性。
+FREE_REASONING_SYSTEM_PROMPT = """You are a visual reasoning assistant. You must structure your response as follows:
 
-For each distinct observation, calculation, or deduction, end that step with </step> before moving on.
+1. Wrap your reasoning process inside <think> and </think> tags.
+2. Inside the thinking block, break your reasoning into clear steps, ending each step with </step>.
+3. After </think>, output your final answer directly.
 
-Example:
-I can see the triangle has a base of 6 units and a height of 8 units.
+Example format:
+<think>
+I observe that the triangle has a base of 6 and height of 8.
 </step>
 Using the formula: Area = 0.5 × base × height = 0.5 × 6 × 8 = 24.
 </step>
-"""
+</think>
+
+The area of the triangle is 24 square units."""
 
 
 # Stage 2: Gemini 错误定位 prompt
