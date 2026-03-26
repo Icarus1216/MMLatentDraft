@@ -36,7 +36,7 @@ from transformers.cache_utils import DynamicCache as _RawDynamicCache
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
 from .controller import RLDController
-from .modules import DraftReadoutAdapter, MultiLayerDraftReadout
+from .modules import DraftReadoutAdapter, MultiLayerDraftReadout, InSituDraftInjector
 
 # ============================================================
 # DynamicCache 兼容层: 仍保留给推理路径使用
@@ -154,7 +154,7 @@ class RLDModel(nn.Module):
         self,
         model_path: str,
         hidden_size: int = 4096,
-        d_z: int = 512,
+        d_z: int = 768,
         num_evidence_slots: int = 16,
         num_draft_slots: int = 16,
         num_trace_slots: int = 16,
@@ -162,11 +162,17 @@ class RLDModel(nn.Module):
         torch_dtype: torch.dtype = torch.bfloat16,
         attn_implementation: str = "flash_attention_2",
         lambda_div: float = 0.01,
+        lambda_kl: float = 0.1,
+        max_scale: float = 0.3,
+        selective_injection: bool = True,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.d_z = d_z
         self.total_layers = total_layers
+        self.lambda_kl = lambda_kl
+        self.max_scale = max_scale
+        self.selective_injection = selective_injection
         self._verbose = _is_main_process()
         # _debug: 仅在 RLD_DEBUG=1 且主进程时启用重量级调试 (含额外 lm_head 计算)
         # ⚠️ 调试模式会导致 rank 0 比其他 rank 慢 20-40s, 可能触发 NCCL timeout
@@ -209,30 +215,41 @@ class RLDModel(nn.Module):
             total_layers=total_layers,
             num_heads=8,
             evidence_layers=2,
-            use_gate=True,
+            use_gate=True,  # [已废弃] 保留兼容旧配置
             lambda_div=lambda_div,
+            max_steps=14,
         )
 
         # 确保 controller 使用与基座相同的 dtype
         self.controller = self.controller.to(dtype=torch_dtype)
 
-        # ====== 3. 创建 MultiLayerDraftReadout (方案 A+C) ======
-        self.readout_adapter = MultiLayerDraftReadout(
+        # ====== 3. 创建 InSituDraftInjector (Top-K Rerun 方案, Phase 3: K=8, 3注入点) ======
+        # Phase 3: K=8, 重算最后 8 层 (L28-L35), 3 个注入点 (L28, L31, L35)
+        # 修正后的 hidden 在 L28-L35 层间通过 self-attention 传播,
+        # 实现 "draft 真正影响后续 token 生成" 的因果一致性。
+        self.rerun_k = 8  # Phase 3: 重算最后 8 层
+        self.readout_adapter = InSituDraftInjector(
             hidden_size=hidden_size,
             d_z=d_z,
             num_heads=8,
             total_layers=total_layers,
-            readout_layer_indices=None,  # 自动选取 [L//4, L//2, 3L//4, L-1]
+            rerun_k=self.rerun_k,
+            injection_offsets=[0, 3, 7],  # Phase 3: L28, L31, L35
+            max_scale=max_scale,
         )
         self.readout_adapter = self.readout_adapter.to(dtype=torch_dtype)
 
         if self._verbose:
             self.controller.print_param_summary()
             adapter_params = sum(p.numel() for p in self.readout_adapter.parameters() if p.requires_grad)
-            print(f"[RLD] MultiLayerDraftReadout 参数: {adapter_params:,} ({adapter_params/1e6:.2f}M)")
-            print(f"[RLD]   Readout 层索引: {self.readout_adapter.layer_indices}")
-            for i, (idx, adapter) in enumerate(zip(self.readout_adapter.layer_indices, self.readout_adapter.adapters)):
-                print(f"[RLD]   Layer {idx}: scale={adapter.scale.item():.2f}")
+            print(f"[RLD] InSituDraftInjector 参数: {adapter_params:,} ({adapter_params/1e6:.2f}M)")
+            print(f"[RLD]   Top-K Rerun: K={self.rerun_k}, rerun_start=L{self.readout_adapter.rerun_start}")
+            print(f"[RLD]   注入层索引: {self.readout_adapter.injection_layer_indices}")
+            print(f"[RLD]   Scale 上界: {max_scale}")
+            print(f"[RLD]   KL 散度正则化: lambda_kl={lambda_kl}")
+            print(f"[RLD]   选择性注入: {selective_injection}")
+            for idx_str, adapter in self.readout_adapter.adapters.items():
+                print(f"[RLD]   Layer {idx_str}: scale={adapter.scale.item():.2f}")
 
         # ====== 4. Step delimiter token ids ======
         self.step_delimiter_ids = None
@@ -466,14 +483,10 @@ class RLDModel(nn.Module):
                 text_pos = torch.arange(seq_len, device=device).unsqueeze(0).expand(B, -1)
                 position_ids = torch.cat([text_pos.unsqueeze(0), position_ids], dim=0)
 
-            # 3d. 手动展开 text_model forward, 收集指定层的 hidden states (方案 C)
-            # 注意: 原生 Qwen3VLTextModel.forward() 不支持 output_hidden_states 参数,
-            # 其返回的 BaseModelOutputWithPast.hidden_states 始终为 None。
-            # 因此我们手动遍历 decoder layers, 在 readout_adapter 需要的层位置收集 hidden states。
+            # 3d. 手动展开 text_model forward, 收集最后层 hidden + 保存 rerun 入口点
+            # Top-K Rerun 方案: Pass 1 跑完全 36 层 (no_grad), 保存 rerun_start-1 层的输出
+            # Pass 2 将用有梯度的方式重算最后 K 层 + adapter 注入
             cache_position = torch.arange(seq_len, device=device)
-
-            # 需要收集 hidden states 的层索引 (readout adapter 使用的层)
-            collect_layer_indices = set(self.readout_adapter.layer_indices)
 
             # ---- 复现 Qwen3VLTextModel.forward() 的内部逻辑 ----
             # (与原生实现严格一致, 参见 modeling_qwen3_vl.py Qwen3VLTextModel.forward)
@@ -506,6 +519,10 @@ class RLDModel(nn.Module):
             # 收集 all_hidden_states: 索引 0 = embedding 输出, 索引 i+1 = layer i 输出
             all_hidden_states_list = [hidden_states]  # 索引 0: embedding 层输出
 
+            # Top-K Rerun: 保存 rerun 起点 (rerun_start 前一层的输出)
+            rerun_start = self.readout_adapter.rerun_start  # Phase 3: 28 (= 36 - 8)
+            rerun_entry_hidden = None  # 将在 layer rerun_start-1 (L27) 之后保存
+
             for layer_idx, decoder_layer in enumerate(text_model.layers):
                 hidden_states = decoder_layer(
                     hidden_states,
@@ -524,18 +541,20 @@ class RLDModel(nn.Module):
                         deepstack_for_fwd[layer_idx],
                     )
 
-                # 仅在 readout adapter 需要的层收集 hidden states
-                if layer_idx in collect_layer_indices:
-                    all_hidden_states_list.append(hidden_states)
-                else:
-                    all_hidden_states_list.append(None)  # 占位, 保持索引对齐
+                # Top-K Rerun: 保存 rerun 起点
+                # rerun_start-1 层的输出就是 Pass 2 的输入
+                if layer_idx == rerun_start - 1:
+                    rerun_entry_hidden = hidden_states.clone()
 
-            # 最终 norm
+                # 收集 hidden states (保持索引对齐)
+                all_hidden_states_list.append(None)  # 占位
+
+            # 最终 norm (完整 36 层的结果, 用于 step summaries)
             hidden_states = text_model.norm(hidden_states)
             all_hidden_states_list.append(hidden_states)  # 索引 L+1: norm 后的输出
 
-            full_hidden = hidden_states  # [B, seq_len, hidden_size]
-            all_hidden_states = tuple(all_hidden_states_list)  # 兼容 MultiLayerDraftReadout 的索引
+            full_hidden = hidden_states  # [B, seq_len, hidden_size], 用于 step summaries
+            all_hidden_states = tuple(all_hidden_states_list)
 
         _t_base_fwd_end = _time.time()
 
@@ -550,31 +569,20 @@ class RLDModel(nn.Module):
                   f"峰值={_max_allocated:.2f}GB",
                   flush=True)
 
-        # ====== 调试: 验证多层 hidden states 已被成功收集 ======
+        # ====== 调试: 验证 rerun 入口已保存 ======
         if self._debug and (not hasattr(self, '_debug_collect_count') or self._debug_collect_count < 2):
             if not hasattr(self, '_debug_collect_count'):
                 self._debug_collect_count = 0
             self._debug_collect_count += 1
-            _collected = []
-            _none_indices = []
-            for _idx, _hs in enumerate(all_hidden_states_list):
-                if _hs is not None:
-                    _collected.append(_idx)
-                else:
-                    _none_indices.append(_idx)
             print("\n" + "=" * 70)
-            print(f"🔍 [RLDModel.forward] 多层 Hidden States 收集验证 (#{self._debug_collect_count})")
-            print(f"   总层数: {len(all_hidden_states_list)} (embedding+{self.total_layers}层+norm)")
-            print(f"   已收集层索引: {_collected}")
-            print(f"   Readout 需要的层索引: {self.readout_adapter.layer_indices}")
-            print(f"   映射关系: layer_idx → all_hidden_states[layer_idx+1]")
-            for _li in self.readout_adapter.layer_indices:
-                _hs = all_hidden_states_list[_li + 1]
-                if _hs is not None:
-                    print(f"   ✅ Layer {_li} → all_hidden_states[{_li+1}]: shape={list(_hs.shape)}, "
-                          f"norm={_hs.detach().float().norm(dim=-1).mean().item():.4f}")
-                else:
-                    print(f"   ❌ Layer {_li} → all_hidden_states[{_li+1}]: None (未收集!)")
+            print(f"🔍 [RLDModel.forward] Top-K Rerun 入口验证 (#{self._debug_collect_count})")
+            print(f"   总层数: {self.total_layers}, rerun_k={self.rerun_k}, rerun_start=L{rerun_start}")
+            print(f"   注入层索引: {self.readout_adapter.injection_layer_indices}")
+            if rerun_entry_hidden is not None:
+                print(f"   ✅ rerun_entry_hidden (L{rerun_start-1}输出): shape={list(rerun_entry_hidden.shape)}, "
+                      f"norm={rerun_entry_hidden.detach().float().norm(dim=-1).mean().item():.4f}")
+            else:
+                print(f"   ❌ rerun_entry_hidden 为 None! rerun_start={rerun_start}")
             print("=" * 70)
 
         # ====== 4. 自动检测 step 边界 ======
@@ -673,14 +681,82 @@ class RLDModel(nn.Module):
         Z_d_expanded = Z_d_stack[step_indices]  # [seq_len, B, K_d, d_z]
         Z_d_expanded = Z_d_expanded.permute(1, 0, 2, 3)  # [B, seq_len, K_d, d_z]
 
-        # ====== 8. MultiLayerDraftReadout: 多层 readout 将 draft 注入 frozen hidden (方案 A+C) ======
-        adapted_hidden = self.readout_adapter(
-            all_hidden_states=all_hidden_states,
-            last_hidden_state=full_hidden,
-            draft_states=Z_d_expanded,
-        )  # [B, seq_len, hidden_size]
+        # ====== 8. Pass 2: Top-K Rerun — 有梯度重算最后 K 层 + in-situ adapter 注入 ======
+        # 核心思想: 从 rerun_entry_hidden (L{rerun_start-1}的输出) 出发,
+        # 重新跑最后 K 层 decoder layer, 在注入点插入 adapter。
+        # 修正后的 hidden 继续参与后续层的 self-attention → 真正的因果一致性。
+        #
+        # Pass 2 的梯度路径: loss → lm_head → norm → rerun layers → adapter → Z_d → controller
+        # 冻结层的参数 requires_grad=False, 但 hidden states 有梯度 (从 adapter 注入)。
+        _t_pass2_start = _time.time()
 
-        # ====== 调试: 注入前后 hidden 对比 (证明 draft 影响了 CoT) ======
+        # ====== 源头选择性注入: 在 Pass 2 rerun 之前计算 token 级置信度权重 ======
+        # 核心思想: 基座模型已经很确定的 token 不需要 draft 修正,
+        # 在 adapter 注入层就直接做 token 级加权, 而非事后衰减。
+        # 这样 KV cache 中也不会包含不必要的修正信息。
+        _inject_weight = None  # [B, seq_len, 1] 或 None
+        if self.selective_injection and labels is not None:
+            with torch.no_grad():
+                # 基座模型原始 logits (用于计算置信度)
+                _base_logits_for_conf = lm_head(full_hidden)  # [B, seq_len, V]
+                base_probs = F.softmax(_base_logits_for_conf, dim=-1)
+                # 基座 top-1 概率: 越高说明越确定, 越不需要修正
+                base_confidence = base_probs.max(dim=-1).values  # [B, seq_len]
+                # 注入权重: 基座越不确定 → 权重越大 (1.0), 基座很确定 → 权重趋近 0
+                # min=0.05: 即使基座 100% 确定, 也保留 5% 的微弱注入 (防止完全断开梯度)
+                _inject_weight = (1.0 - base_confidence).clamp(min=0.05).unsqueeze(-1)  # [B, seq_len, 1]
+                del base_probs  # 立即释放显存
+                # 注意: _base_logits_for_conf 保留, 供后续 KL 散度复用
+
+        # 从 rerun 入口点出发, detach 切断与 Pass 1 的梯度连接
+        rerun_hidden = rerun_entry_hidden.detach()
+
+        # 注意: position_embeddings, _attention_mask, _text_position_ids, cache_position
+        # 都是在 no_grad 块中定义的局部变量, 它们不需要梯度 (纯位置信息)
+        for layer_idx in range(rerun_start, self.total_layers):
+            decoder_layer = text_model.layers[layer_idx]
+            # 冻结层 forward: 参数 requires_grad=False, 但输入 hidden 有梯度
+            # → 输出 hidden 有梯度 (因为是 hidden 的函数)
+            rerun_hidden = decoder_layer(
+                rerun_hidden,
+                attention_mask=_attention_mask,
+                position_ids=_text_position_ids,
+                past_key_values=None,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+
+            # DeepStack: 通常不会触发 (DeepStack 只影响前几层)
+            if deepstack_for_fwd is not None and layer_idx in range(len(deepstack_for_fwd)):
+                rerun_hidden = text_model._deepstack_process(
+                    rerun_hidden,
+                    visual_pos_masks,
+                    deepstack_for_fwd[layer_idx],
+                )
+
+            # ★ In-situ adapter 注入 (源头选择性): inject_weight 在 adapter 内部直接加权修正量
+            # 基座确定的 token → 修正量被压缩 → KV 中几乎不含 draft 信息
+            # 基座不确定的 token → 修正量充分保留 → draft 在关键位置发力
+            rerun_hidden = self.readout_adapter.inject(
+                layer_idx, rerun_hidden, Z_d_expanded, inject_weight=_inject_weight
+            )
+
+        # 最终 norm (有梯度)
+        adapted_hidden = text_model.norm(rerun_hidden)
+
+        # ====== 基座 logits 缓存 (供 KL 散度复用) ======
+        _cached_base_logits = None
+        if self.lambda_kl > 0 and labels is not None:
+            if self.selective_injection and _inject_weight is not None:
+                # 复用选择性注入阶段已计算的基座 logits (避免重复 lm_head 计算)
+                _cached_base_logits = _base_logits_for_conf
+            else:
+                with torch.no_grad():
+                    _cached_base_logits = lm_head(full_hidden)  # [B, seq_len, V]
+
+        _t_pass2_end = _time.time()
+
+        # ====== 调试: Pass 2 注入前后 hidden 对比 (证明 draft 影响了 CoT) ======
         # ⚠️ 仅在 RLD_DEBUG=1 时执行, 包含额外 lm_head 计算, 会导致 rank 0 显著变慢
         if self._debug and (not hasattr(self, '_debug_inject_count') or self._debug_inject_count < 1):
             if not hasattr(self, '_debug_inject_count'):
@@ -706,8 +782,10 @@ class RLDModel(nn.Module):
                 del _logits_original, _logits_adapted
 
                 print("\n" + "=" * 70)
-                print(f"🎯 [RLDModel.forward] 多层 Draft 注入效果验证 (#{self._debug_inject_count})")
+                print(f"🎯 [RLDModel.forward] Top-K Rerun Draft 注入效果验证 (#{self._debug_inject_count})")
                 print(f"   序列长度: {seq_len}, Step 数: {len(split_points)}, Z_d 版本数: {len(all_Z_d)}")
+                print(f"   Rerun K={self.rerun_k}, 注入层: {self.readout_adapter.injection_layer_indices}")
+                print(f"   Pass 2 耗时: {_t_pass2_end - _t_pass2_start:.2f}s")
                 print(f"   ── Hidden 修正量 ──")
                 print(f"   修正量 L2 范数 (全序列均值): {_diff_norm.mean().item():.6f}")
                 print(f"   修正量 L2 范数 (最大值):     {_diff_norm.max().item():.6f}")
@@ -717,7 +795,7 @@ class RLDModel(nn.Module):
                 print(f"   Logit 绝对差均值 (前{_sample_len}token): {_logit_diff:.6f}")
                 print(f"   Top-1 token 变化率:           {_top1_changed*100:.1f}%")
                 if _diff_norm.mean().item() > 1e-8:
-                    print(f"   ✅ 多层 Draft 注入正在影响 CoT: hidden 被修正, logits 已改变")
+                    print(f"   ✅ Top-K Rerun Draft 注入正在影响 CoT: hidden 被修正, logits 已改变")
                 else:
                     print(f"   ⚠️ Draft 注入量极小, 可能尚未学到有效修正")
                 print("=" * 70)
@@ -729,6 +807,7 @@ class RLDModel(nn.Module):
         # ====== 10. 计算 loss ======
         total_loss = torch.tensor(0.0, device=device, dtype=ctrl_dtype)
         main_loss = torch.tensor(0.0, device=device, dtype=ctrl_dtype)
+        kl_loss = torch.tensor(0.0, device=device, dtype=ctrl_dtype)
 
         if labels is not None:
             # 标准 next-token prediction: shift logits 和 labels
@@ -738,7 +817,59 @@ class RLDModel(nn.Module):
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
             ce_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             main_loss = ce_loss.detach()
-            total_loss = ce_loss + div_loss
+
+            # ====== KL 散度正则化: 防止 adapted logits 偏离基座 logits 太远 ======
+            # 核心思想: draft 只应做 "微调" 而非 "重写", KL 散度惩罚过大的分布偏移
+            # 只在有效 label 位置计算 KL (忽略 padding 和 prompt)
+            kl_loss = torch.tensor(0.0, device=device, dtype=ctrl_dtype)
+            if self.lambda_kl > 0:
+                with torch.no_grad():
+                    # 复用缓存的基座 logits (避免重复计算 lm_head(full_hidden))
+                    if _cached_base_logits is not None:
+                        base_log_probs = F.log_softmax(_cached_base_logits[:, :-1, :], dim=-1)
+                    else:
+                        base_logits_for_kl = lm_head(full_hidden)  # fallback: 重新计算
+                        base_log_probs = F.log_softmax(base_logits_for_kl[:, :-1, :], dim=-1)
+                        del base_logits_for_kl
+                    # 构建有效 token mask: 只在有 label 的位置计算 KL
+                    valid_mask = (shift_labels != -100)  # [B, seq_len-1]
+
+                # adapted logits 的 log_softmax (有梯度)
+                adapted_log_probs = F.log_softmax(shift_logits, dim=-1)
+
+                # KL(base || adapted) = Σ p_base * (log p_base - log p_adapted)
+                # 使用 F.kl_div(input=log_adapted, target=log_base, log_target=True)
+                # 逐 token 计算, 然后只对有效位置取均值
+                kl_per_token = F.kl_div(
+                    adapted_log_probs,
+                    base_log_probs.detach(),
+                    reduction='none',
+                    log_target=True,
+                ).sum(dim=-1)  # [B, seq_len-1]
+
+                # 只对有效 label 位置取均值
+                if valid_mask.any():
+                    kl_loss = (kl_per_token * valid_mask.float()).sum() / valid_mask.float().sum().clamp(min=1.0)
+                else:
+                    kl_loss = kl_per_token.mean()
+
+                del base_log_probs, adapted_log_probs, kl_per_token  # 释放显存
+
+            # 释放缓存的基座 logits (KL 散度已使用完毕)
+            if _cached_base_logits is not None:
+                del _cached_base_logits
+
+            # ====== Scale L2 软约束: 温和地拉回 scale, 替代硬 clamp 的梯度断裂问题 ======
+            # 硬 clamp 在 scale > max_scale 时梯度为 0 (卡死), L2 正则化始终有梯度
+            # lambda_scale_l2 * Σ scale² → scale 被温和地拉向 0
+            # 配合 adapter 内部的范数比约束 (max_adapt_ratio=15%), 双重保障
+            scale_l2_loss = torch.tensor(0.0, device=device, dtype=ctrl_dtype)
+            lambda_scale_l2 = 0.1  # Scale L2 正则化权重
+            for _idx_str, _adapter in self.readout_adapter.adapters.items():
+                scale_l2_loss = scale_l2_loss + _adapter.scale ** 2
+            scale_l2_loss = lambda_scale_l2 * scale_l2_loss
+
+            total_loss = ce_loss + div_loss + self.lambda_kl * kl_loss + scale_l2_loss
 
         # 确保 total_loss 有 grad_fn (DeepSpeed 要求)
         if total_loss.grad_fn is None and self.training:
@@ -767,12 +898,9 @@ class RLDModel(nn.Module):
             )
             _draft_metrics_accum['draft/num_steps'] = float(len(split_points))
             _draft_metrics_accum['draft/readout_scale'] = self.readout_adapter.scale.detach().item()
-            # 方案 C: 记录每层 adapter 的 scale
-            for i, (layer_idx, adapter) in enumerate(zip(
-                self.readout_adapter.layer_indices,
-                self.readout_adapter.adapters,
-            )):
-                _draft_metrics_accum[f'draft/readout_scale_L{layer_idx}'] = adapter.scale.detach().item()
+            # Top-K Rerun: 记录每个注入层 adapter 的 scale
+            for idx_str, adapter in self.readout_adapter.adapters.items():
+                _draft_metrics_accum[f'draft/readout_scale_L{idx_str}'] = adapter.scale.detach().item()
 
             # 多层注入效果量化指标 (用于 TensorBoard)
             _diff_for_metric = (adapted_hidden - full_hidden.to(adapted_hidden.dtype)).float()
@@ -782,6 +910,38 @@ class RLDModel(nn.Module):
                 max(full_hidden.float().norm(dim=-1).mean().item(), 1e-8)
             )
 
+            # 四重防线监控指标
+            _draft_metrics_accum['loss/kl_loss'] = kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss
+            _draft_metrics_accum['loss/scale_l2_loss'] = scale_l2_loss.item() if isinstance(scale_l2_loss, torch.Tensor) else 0.0
+            # 选择性注入权重统计: 反映基座置信度分布
+            if _inject_weight is not None:
+                _iw = _inject_weight.squeeze(-1)  # [B, seq_len]
+                _draft_metrics_accum['draft/inject_weight_mean'] = _iw.mean().item()
+                _draft_metrics_accum['draft/inject_weight_min'] = _iw.min().item()
+                _draft_metrics_accum['draft/inject_weight_max'] = _iw.max().item()
+                _draft_metrics_accum['draft/inject_weight_std'] = _iw.std().item()
+                # 分位数统计: 了解 inject_weight 的分布形态
+                _draft_metrics_accum['draft/inject_weight_p10'] = _iw.quantile(0.1).item()
+                _draft_metrics_accum['draft/inject_weight_p25'] = _iw.quantile(0.25).item()
+                _draft_metrics_accum['draft/inject_weight_median'] = _iw.quantile(0.5).item()
+                _draft_metrics_accum['draft/inject_weight_p75'] = _iw.quantile(0.75).item()
+                _draft_metrics_accum['draft/inject_weight_p90'] = _iw.quantile(0.9).item()
+                # 分桶占比: 直观了解基座置信度分布
+                # 低注入 (weight < 0.1): 基座非常确定, draft 几乎不参与
+                _draft_metrics_accum['draft/iw_bucket_very_low'] = (_iw < 0.1).float().mean().item()
+                # 低注入 (0.1 ≤ weight < 0.2): 基座较确定
+                _draft_metrics_accum['draft/iw_bucket_low'] = ((_iw >= 0.1) & (_iw < 0.2)).float().mean().item()
+                # 中注入 (0.2 ≤ weight < 0.5): 基座中等不确定, draft 有意义的辅助区间
+                _draft_metrics_accum['draft/iw_bucket_medium'] = ((_iw >= 0.2) & (_iw < 0.5)).float().mean().item()
+                # 高注入 (0.5 ≤ weight < 0.8): 基座较不确定, draft 重要发力区间
+                _draft_metrics_accum['draft/iw_bucket_high'] = ((_iw >= 0.5) & (_iw < 0.8)).float().mean().item()
+                # 极高注入 (weight ≥ 0.8): 基座犯错, draft 关键修正区间
+                _draft_metrics_accum['draft/iw_bucket_very_high'] = (_iw >= 0.8).float().mean().item()
+                # 有效训练信号占比: inject_weight ≥ 0.2 的 token 才能提供有意义的梯度
+                _draft_metrics_accum['draft/effective_signal_ratio'] = (_iw >= 0.2).float().mean().item()
+                # 兼容旧指标名
+                _draft_metrics_accum['draft/low_inject_ratio'] = (_iw < 0.2).float().mean().item()
+
         # ====== forward 阶段耗时汇总 ======
         _fwd_end = _time.time()
         _fwd_total = _fwd_end - _fwd_start
@@ -790,17 +950,20 @@ class RLDModel(nn.Module):
         if _should_profile or _force_profile:
             _t_vision = _t_vision_end - _t_vision_start
             _t_base = _t_base_fwd_end - _t_base_fwd_start
-            _t_rest = _fwd_total - _t_vision - _t_base
+            _t_pass2 = _t_pass2_end - _t_pass2_start
+            _t_rest = _fwd_total - _t_vision - _t_base - _t_pass2
             _warn = " ⚠️ SLOW" if _fwd_total > 30 else ""
             print(f"[rank {_rank}] fwd#{self._fwd_count} 耗时: "
                   f"total={_fwd_total:.1f}s (vision={_t_vision:.1f}s, "
-                  f"base_fwd={_t_base:.1f}s, ctrl+readout+loss={_t_rest:.1f}s) "
-                  f"steps={len(split_points)}{_warn}", flush=True)
+                  f"pass1={_t_base:.1f}s, pass2={_t_pass2:.1f}s, "
+                  f"ctrl+loss={_t_rest:.1f}s) "
+                  f"steps={len(split_points)} rerun_k={self.rerun_k}{_warn}", flush=True)
 
         return {
             'loss': total_loss,
             'main_loss': main_loss,
             'div_loss': div_loss.detach(),
+            'kl_loss': kl_loss.detach() if isinstance(kl_loss, torch.Tensor) else torch.tensor(0.0),
             'logits': None,  # 不返回完整 logits (太大)
             'rld_state': rld_state,
             'draft_metrics': _draft_metrics_accum,
@@ -825,13 +988,13 @@ class RLDModel(nn.Module):
         do_sample: bool = True,
     ) -> torch.Tensor:
         """
-        推理时的生成 (训推一致: 使用 readout adapter)
+        推理时的生成 (Top-K Rerun 训推一致: 使用 forward hook in-situ injection)
         
         核心设计:
-        - 与训练路径完全一致: 每个 token 都用 readout_adapter(h_t, Z_d) 修正 hidden
-        - 无需 prefix KV cache, 无需 hook, 无需额外 forward
+        - 在注入层 (如 L35) 注册 forward hook, 自动修正 hidden states
+        - 修正后的 hidden 写入 KV cache, 后续 token 的 self-attention 自然看到修正值
         - 遇到 </step> delimiter 时触发 controller.step_update 更新 Z_d
-        - readout adapter 的开销极小 (单 token: [1, 1, 512] × [1, 16, 512], <0.1ms)
+        - hook 中引用的 Z_d 会实时更新, 无需手动管理
         """
         B = input_ids.shape[0]
         device = input_ids.device
@@ -909,14 +1072,55 @@ class RLDModel(nn.Module):
         past_key_values = prefill_out.past_key_values
         mrope_last_pos = position_ids[1:, :, -1:] if position_ids is not None else None
 
-        # ★ 用 readout adapter 修正 prefill 最后一个 token 的 hidden (训推一致)
-        # 推理时使用 forward_single_token (仅最后一层 adapter)
-        prefill_hidden = prefill_out.last_hidden_state  # [B, prompt_len, H]
+        # ====== 注册 forward hook: 在注入层自动修正 hidden ======
+        # 使用可变引用 (list) 来持有当前 Z_d, hook 中通过引用读取最新值
         Z_d_current = rld_state['Z_d']  # [B, K_d, d_z]
-        # 只需修正最后一个 token
+        _z_d_ref = [Z_d_current]  # 可变容器, hook 中引用
+
+        # ====== 推理时选择性注入: 保证训推一致 ======
+        # 训练时 inject_weight 由基座 logits 计算, 推理时也需要同样的机制
+        # 使用可变引用持有当前 inject_weight, 每个 token 生成后更新
+        _inject_weight_ref = [None]  # [B, 1, 1] 或 None, hook 中引用
+
+        def _make_injection_hook(layer_idx, injector, z_d_ref, inject_weight_ref):
+            """为指定层创建 in-situ injection hook (支持选择性注入)"""
+            def hook_fn(module, input, output):
+                # output: [B, T, H] (T=1 for autoregressive, T=prompt_len for prefill)
+                z_d = z_d_ref[0]  # [B, K_d, d_z]
+                T = output.shape[1]
+                draft = z_d.unsqueeze(1).expand(-1, T, -1, -1)  # [B, T, K_d, d_z]
+                iw = inject_weight_ref[0]  # [B, 1, 1] 或 None
+                if iw is not None and T > 1:
+                    # prefill 阶段: inject_weight 可能需要扩展到 T
+                    iw = iw.expand(-1, T, -1)  # [B, T, 1]
+                return injector.inject_single_token(layer_idx, output, draft, inject_weight=iw)
+            return hook_fn
+
+        _hooks = []
+        for inj_layer_idx in self.readout_adapter.injection_layer_indices:
+            h = text_model.layers[inj_layer_idx].register_forward_hook(
+                _make_injection_hook(inj_layer_idx, self.readout_adapter, _z_d_ref, _inject_weight_ref)
+            )
+            _hooks.append(h)
+
+        # ★ prefill 最后一个 token 的 logits (hook 已注册，但 prefill 已经跑完了)
+        # 需要用 adapter 手动修正最后一个 token
+        prefill_hidden = prefill_out.last_hidden_state  # [B, prompt_len, H]
         last_hidden = prefill_hidden[:, -1:, :]  # [B, 1, H]
         last_draft = Z_d_current.unsqueeze(1)  # [B, 1, K_d, d_z]
-        adapted_last = self.readout_adapter.forward_single_token(last_hidden, last_draft)  # [B, 1, H]
+
+        # ====== 推理时选择性注入: 计算 prefill 最后 token 的 inject_weight ======
+        if self.selective_injection:
+            _prefill_logits = lm_head(last_hidden)  # [B, 1, V]
+            _prefill_probs = F.softmax(_prefill_logits, dim=-1)
+            _prefill_conf = _prefill_probs.max(dim=-1).values  # [B, 1]
+            _prefill_iw = (1.0 - _prefill_conf).clamp(min=0.05).unsqueeze(-1)  # [B, 1, 1]
+            _inject_weight_ref[0] = _prefill_iw
+            del _prefill_logits, _prefill_probs
+        
+        adapted_last = self.readout_adapter.forward_single_token(
+            last_hidden, last_draft, inject_weight=_inject_weight_ref[0]
+        )  # [B, 1, H]
         next_token_logits = lm_head(adapted_last).squeeze(1)  # [B, V]
 
         # 收集 step hidden 用于 delimiter 触发时的 step_update
@@ -959,11 +1163,11 @@ class RLDModel(nn.Module):
         )
         past_key_values = think_outputs.past_key_values
 
-        # ★ 用 readout adapter 修正 <think>\n 最后一个 token
-        think_last_hidden = think_outputs.last_hidden_state[:, -1:, :]  # [B, 1, H]
-        think_last_draft = Z_d_current.unsqueeze(1)  # [B, 1, K_d, d_z]
-        adapted_think_last = self.readout_adapter.forward_single_token(think_last_hidden, think_last_draft)
-        next_token_logits = lm_head(adapted_think_last).squeeze(1)  # [B, V]
+        # ★ Hook 已注册, think forward 中最后一层的 hidden 已被 hook 修正
+        # 但 text_model.forward 内部在 decoder layers 之后还有 norm，
+        # last_hidden_state 是 norm(修正后的hidden), 可以直接用
+        # 注意: hook 修正的是 decoder layer 的输出, norm 在最后
+        next_token_logits = lm_head(think_outputs.last_hidden_state[:, -1:, :]).squeeze(1)  # [B, V]
 
         mrope_last_pos = think_mrope_pos_full[:, :, -1:]
 
@@ -1022,11 +1226,19 @@ class RLDModel(nn.Module):
             past_key_values = text_outputs.past_key_values
             hidden_states = text_outputs.last_hidden_state  # [B, 1, H]
 
-            # ★ 用 readout adapter 修正 (训推一致, 推理时仅用最后一层 adapter)
-            Z_d_current = rld_state['Z_d']  # [B, K_d, d_z]
-            token_draft = Z_d_current.unsqueeze(1)  # [B, 1, K_d, d_z]
-            adapted_hidden = self.readout_adapter.forward_single_token(hidden_states, token_draft)  # [B, 1, H]
-            next_token_logits = lm_head(adapted_hidden[:, -1, :])  # [B, V]
+            # ★ Hook 已在注入层自动修正 hidden, last_hidden_state 是 norm(修正后) 的结果
+            # 直接过 lm_head 即可
+            next_token_logits = lm_head(hidden_states[:, -1, :])  # [B, V]
+
+            # ====== 推理时选择性注入: 更新 inject_weight 供下一个 token 的 hook 使用 ======
+            # 基于当前 token 的 logits 计算置信度, 用于下一个 token 的注入控制
+            # 开销: 仅一次 softmax + max, 相比 lm_head 的矩阵乘法可忽略
+            if self.selective_injection:
+                with torch.no_grad():
+                    _gen_probs = F.softmax(next_token_logits, dim=-1)  # [B, V]
+                    _gen_conf = _gen_probs.max(dim=-1).values  # [B]
+                    _gen_iw = (1.0 - _gen_conf).clamp(min=0.05).unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
+                    _inject_weight_ref[0] = _gen_iw
 
             mrope_last_pos = new_mrope_pos
 
@@ -1067,7 +1279,8 @@ class RLDModel(nn.Module):
                         rld_state = self.controller.step_update(
                             rld_state, step_hiddens_gen, update_mask=trigger_mask
                         )
-                        # Z_d_current 会在下一个 token 的 readout 中自动使用新值
+                        # 更新 hook 中的 Z_d 引用 (可变容器, hook 实时读取)
+                        _z_d_ref[0] = rld_state['Z_d']
 
                     for b in range(B):
                         if trigger_mask[b]:
@@ -1075,6 +1288,10 @@ class RLDModel(nn.Module):
                             recent_tokens[b] = []
 
             current_pos += 1
+
+        # 清理 forward hooks
+        for h in _hooks:
+            h.remove()
 
         return generated_ids
 

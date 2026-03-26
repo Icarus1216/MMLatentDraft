@@ -16,8 +16,10 @@ from .modules import (
     TraceUpdater,
     ReflectionModule,
     DraftUpdater,
+    ResidualFlowDraftUpdater,
     DraftReadoutAdapter,
     MultiLayerDraftReadout,
+    InSituDraftInjector,
 )
 from .controller import RLDController
 from .model import RLDModel

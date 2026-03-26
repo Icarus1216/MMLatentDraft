@@ -18,7 +18,7 @@ model:
 # RLD Controller 配置
 rld:
   # 维度配置
-  d_z: 512                   # controller 空间维度 (独立于 KV 空间, 保持紧凑)
+  d_z: 768                   # controller 空间维度 (独立于 KV 空间, 768 维提升图表/空间推理表达力)
   
   # 槽位配置
   num_evidence_slots: 16     # 冻结视觉证据槽 K_e
@@ -30,13 +30,37 @@ rld:
   
   # 正则化
   lambda_div: 0.1            # 多样性正则化权重 (配合 threshold=0.3 的余弦惩罚, 只惩罚 cosim>0.3 的部分)
+  
+  # ====== 防止 Draft 替代基座推理的四重防线 ======
+  #
+  # 1. KL 散度正则化: 惩罚 adapted logits 偏离基座 logits 的程度
+  #    让 draft 只做 "微调" 而非 "重写"
+  #    建议范围: 0.05~0.3 (KL 量级通常比 CE 大, 不宜设太高)
+  lambda_kl: 0.1
+  
+  # 2. Scale 上界 + L2 软约束:
+  #    - 硬上界 (clamp): 防止极端情况, 但主要靠 L2 正则化
+  #    - L2 正则化 (lambda=0.1): 温和拉回 scale, 梯度始终存在 (不像 clamp 梯度断裂)
+  #    建议范围: 0.3~0.5
+  max_scale: 0.3
+  
+  # 3. 修正量范数比约束 (adapter 内部):
+  #    限制 ||delta|| / ||h|| ≤ max_adapt_ratio (默认 15%)
+  #    即使 scale 和 adapter 权重都很大, 修正量也不会超过原始 hidden 的 15%
+  #    这是比 scale clamp 更本质的约束
+  
+  # 4. 源头选择性注入: 在 Pass 2 的 adapter 注入层直接做 token 级加权
+  #    基座越确定的 token → 注入权重越小 (最低 0.05) → KV 中几乎不含 draft 信息
+  #    基座越不确定的 token → 注入权重越大 (最高 1.0) → draft 在关键位置发力
+  #    相比旧版"事后衰减", 源头控制确保 KV cache 也不被不必要地修改
+  selective_injection: true
 
 # 数据配置
 data:
   # 训练数据: JSON 格式
   # 每个样本: {"image": path, "question": text, "answer": text}
   # answer 中可以包含 </step> 作为步骤分隔符
-  train_json: "/mnt/cephszjt/user_juntianzhang/LatentDraft/data/rld_mmathcot_filtered_checked.json"
+  train_json: "/mnt/cephszjt/user_juntianzhang/LatentDraft/data/rld_50k_selected.json"
   # eval_json: "/path/to/your/rld_val.json"   # 可选，暂未配置
   
   # 自动分步: 对于无 </step> 标注的数据，按句号/换行自动分段
@@ -68,7 +92,7 @@ data:
 
 # 训练配置
 training:
-  output_dir: "./outputs/rld_train"
+  output_dir: "./outputs/rld_top8_rerun_768"
   
   # 训练参数
   num_epochs: 1

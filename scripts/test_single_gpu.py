@@ -81,7 +81,7 @@ def main():
     model = RLDModel(
         model_path=model_config['model_path'],
         hidden_size=model_config.get('hidden_size', 2048),
-        d_z=rld_config.get('d_z', 512),
+        d_z=rld_config.get('d_z', 768),
         num_evidence_slots=rld_config.get('num_evidence_slots', 16),
         num_draft_slots=rld_config.get('num_draft_slots', 16),
         num_trace_slots=rld_config.get('num_trace_slots', 16),

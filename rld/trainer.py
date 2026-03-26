@@ -40,7 +40,8 @@ class RLDTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.controller_lr = controller_lr
         self.monitor_every_n_steps = monitor_every_n_steps
-        self._step_count = 0
+        self._step_count = 0        # optimizer step 计数 (与 Trainer tqdm 一致)
+        self._fwd_count = 0         # forward pass 计数 (含梯度累积的中间 forward)
         self._train_start_time = None  # 首次 step 时记录，用于计算 ETA
         # 梯度捕获: 通过 backward hook 在梯度实际产生时记录
         # - DDP 模式: hook 和 param.grad 都可靠，hook 优先 (更及时)
@@ -97,92 +98,16 @@ class RLDTrainer(Trainer):
                 print()
 
         # ====== Draft 状态监控指标 → 暂存 (不在 compute_loss 中调用 self.log) ======
-        self._step_count += 1
+        self._fwd_count += 1
         draft_metrics = outputs.get('draft_metrics', {})
 
-        # 暂存日志指标，在 training_step 中统一记录
-        self._pending_log_dict = None
-        self._pending_console_output = None
-
-        # 每 logging_steps 准备 draft 指标
-        if draft_metrics and self._step_count % max(self.args.logging_steps, 1) == 0:
-            log_dict = {}
-            for key, value in draft_metrics.items():
-                if isinstance(value, (int, float)):
-                    log_dict[key] = value
-            # main_loss 和 div_loss 也记录到 TensorBoard
-            log_dict['loss/main_loss'] = outputs.get('main_loss', torch.tensor(0.0)).item()
-            log_dict['loss/div_loss'] = outputs.get('div_loss', torch.tensor(0.0)).item()
-            log_dict['loss/total_loss'] = loss.item()
-            self._pending_log_dict = log_dict
-
-        # 每 monitor_every_n_steps 准备详细监控信息
-        if self._step_count % self.monitor_every_n_steps == 0 and self._is_main_process():
-            main_loss = outputs.get('main_loss', torch.tensor(0.0))
-            div_loss = outputs.get('div_loss', torch.tensor(0.0))
-            lines = []
-            lines.append(f"\n{'='*70}")
-            lines.append(f"[RLD Step {self._step_count}] Loss 概览")
-            lines.append(f"  total_loss={loss.item():.4f}, "
-                  f"main_loss={main_loss.item():.4f}, "
-                  f"div_loss={div_loss.item():.4f}")
-
-            if draft_metrics:
-                lines.append(f"\n  📊 Draft 状态监控:")
-                # 有效秩
-                if 'draft/Zd_effective_rank' in draft_metrics:
-                    lines.append(f"    Z_d 有效秩: {draft_metrics['draft/Zd_effective_rank']:.2f}")
-                if 'draft/Ze_effective_rank' in draft_metrics:
-                    lines.append(f"    Z_e 有效秩: {draft_metrics['draft/Ze_effective_rank']:.2f}")
-                if 'draft/T_effective_rank' in draft_metrics:
-                    lines.append(f"    T 轨迹有效秩: {draft_metrics['draft/T_effective_rank']:.2f}")
-                # 槽间相似度
-                if 'draft/Zd_slot_cosim' in draft_metrics:
-                    cosim = draft_metrics['draft/Zd_slot_cosim']
-                    status = "✅" if cosim < 0.5 else ("⚠️" if cosim < 0.8 else "❌坍塌")
-                    lines.append(f"    Z_d 槽间余弦相似度: {cosim:.4f} {status}")
-                # 段间变化率
-                if 'draft/Zd_relative_delta' in draft_metrics:
-                    delta = draft_metrics['draft/Zd_relative_delta']
-                    status = "✅" if 0.05 <= delta <= 0.3 else ("⚠️过小" if delta < 0.05 else "⚠️过大")
-                    lines.append(f"    Z_d 段间变化率: {delta:.4f} {status}")
-                # 段间 prefix 余弦相似度
-                if 'draft/prefix_inter_seg_cosim' in draft_metrics:
-                    cosim = draft_metrics['draft/prefix_inter_seg_cosim']
-                    status = "✅" if 0.7 <= cosim <= 0.95 else ("⚠️不变" if cosim > 0.95 else "⚠️剧变")
-                    lines.append(f"    段间 prefix 余弦相似度: {cosim:.4f} {status}")
-                # Evidence Gate β
-                if 'draft/beta_mean' in draft_metrics:
-                    lines.append(f"    Evidence Gate β: "
-                          f"mean={draft_metrics['draft/beta_mean']:.4f}, "
-                          f"std={draft_metrics['draft/beta_std']:.4f}, "
-                          f"range=[{draft_metrics.get('draft/beta_min', 0):.4f}, "
-                          f"{draft_metrics.get('draft/beta_max', 0):.4f}]")
-                # 范数
-                if 'draft/Zd_norm' in draft_metrics:
-                    lines.append(f"    Z_d 范数: {draft_metrics['draft/Zd_norm']:.4f}")
-
-                # ====== 多层 Draft 注入效果 ======
-                lines.append(f"\n  🎯 多层 Draft 注入效果:")
-                if 'draft/inject_norm_mean' in draft_metrics:
-                    inject_norm = draft_metrics['draft/inject_norm_mean']
-                    inject_ratio = draft_metrics.get('draft/inject_ratio', 0.0)
-                    status = "✅生效" if inject_norm > 1e-6 else "⚠️极小"
-                    lines.append(f"    注入修正量 L2 范数: {inject_norm:.6f} {status}")
-                    lines.append(f"    修正/原始比: {inject_ratio:.6f}")
-                # 各层 scale 汇总
-                _scale_lines = []
-                for key in sorted(draft_metrics.keys()):
-                    if key.startswith('draft/readout_scale_L'):
-                        layer_num = key.split('_L')[-1]
-                        _scale_lines.append(f"L{layer_num}={draft_metrics[key]:.4f}")
-                if _scale_lines:
-                    lines.append(f"    各层 Readout Scale: {', '.join(_scale_lines)}")
-                if 'draft/num_steps' in draft_metrics:
-                    lines.append(f"    Step 数量: {int(draft_metrics['draft/num_steps'])}")
-
-            lines.append(f"{'='*70}")
-            self._pending_console_output = "\n".join(lines)
+        # 暂存最新的 draft_metrics 和 loss (在梯度累积期间可能被多次覆盖,
+        # 最终 training_step 中使用的是最后一次 forward 的值)
+        self._pending_draft_metrics = draft_metrics
+        self._pending_main_loss = outputs.get('main_loss', torch.tensor(0.0))
+        self._pending_div_loss = outputs.get('div_loss', torch.tensor(0.0))
+        self._pending_kl_loss = outputs.get('kl_loss', torch.tensor(0.0))
+        self._pending_total_loss = loss
 
         # 暂存 outputs 供 training_step 后收集梯度指标
         self._last_outputs = outputs
@@ -209,6 +134,10 @@ class RLDTrainer(Trainer):
 
         loss = super().training_step(model, inputs, num_items_in_batch)
 
+        # 同步 optimizer step 计数: 使用 Trainer 内部的 global_step
+        # global_step 在 optimizer.step() 后才递增，与 tqdm 进度条完全一致
+        self._step_count = self.state.global_step
+
         _t_end = _time.time()
         _duration = _t_end - _t_start
         # 每 10 步由 rank 0 打印耗时 + 训练进度; 异常耗时 (>60s) 所有 rank 打印
@@ -232,17 +161,45 @@ class RLDTrainer(Trainer):
                 )
             print(f"[rank {_rank}] step={self._step_count} 耗时={_duration:.1f}s{_warn}{_progress_info}", flush=True)
 
-        # 输出 compute_loss 中暂存的日志 (避免在 compute_loss 中调用 self.log)
-        if getattr(self, '_pending_log_dict', None) is not None:
-            self.log(self._pending_log_dict)
-            self._pending_log_dict = None
+        # ====== 在 optimizer step 边界统一处理日志 (避免梯度累积中间步触发) ======
+        # 检查是否刚完成一个完整的 optimizer step
+        _grad_accum = self.args.gradient_accumulation_steps
+        _is_optim_step = (self._fwd_count % _grad_accum == 0)
 
-        if getattr(self, '_pending_console_output', None) is not None:
-            print(self._pending_console_output)
-            self._pending_console_output = None
+        if _is_optim_step:
+            # 准备 draft 日志指标
+            draft_metrics = getattr(self, '_pending_draft_metrics', {})
+            if draft_metrics and self._step_count % max(self.args.logging_steps, 1) == 0:
+                log_dict = {}
+                for key, value in draft_metrics.items():
+                    if isinstance(value, (int, float)):
+                        log_dict[key] = value
+                log_dict['loss/main_loss'] = self._pending_main_loss.item() if hasattr(self._pending_main_loss, 'item') else 0.0
+                log_dict['loss/div_loss'] = self._pending_div_loss.item() if hasattr(self._pending_div_loss, 'item') else 0.0
+                log_dict['loss/kl_loss'] = self._pending_kl_loss.item() if hasattr(self._pending_kl_loss, 'item') else 0.0
+                log_dict['loss/total_loss'] = self._pending_total_loss.item() if hasattr(self._pending_total_loss, 'item') else 0.0
+                self.log(log_dict)
 
-        # 每 monitor_every_n_steps 收集梯度范数
-        if self._step_count % self.monitor_every_n_steps == 0:
+            # 准备详细监控信息
+            if self._step_count > 0 and self._step_count % self.monitor_every_n_steps == 0 and self._is_main_process():
+                main_loss = getattr(self, '_pending_main_loss', torch.tensor(0.0))
+                div_loss = getattr(self, '_pending_div_loss', torch.tensor(0.0))
+                kl_loss = getattr(self, '_pending_kl_loss', torch.tensor(0.0))
+                total_loss = getattr(self, '_pending_total_loss', torch.tensor(0.0))
+                lines = []
+                lines.append(f"\n{'='*70}")
+                lines.append(f"[RLD Step {self._step_count}] Loss 概览 (fwd#{self._fwd_count})")
+                lines.append(f"  total_loss={total_loss.item():.4f}, "
+                      f"main_loss={main_loss.item():.4f}, "
+                      f"div_loss={div_loss.item():.4f}, "
+                      f"kl_loss={kl_loss.item():.4f}")
+                if draft_metrics:
+                    lines.extend(self._format_draft_monitor(draft_metrics))
+                lines.append(f"{'='*70}")
+                print("\n".join(lines))
+
+        # 每 monitor_every_n_steps 收集梯度范数 (在 optimizer step 边界)
+        if _is_optim_step and self._step_count > 0 and self._step_count % self.monitor_every_n_steps == 0:
             grad_metrics = self._collect_grad_metrics(model)
             if grad_metrics:
                 # 记录到 TensorBoard
@@ -450,6 +407,108 @@ class RLDTrainer(Trainer):
             h, rem = divmod(int(seconds), 3600)
             m, s = divmod(rem, 60)
             return f"{h}h{m:02d}m{s:02d}s"
+
+    def _format_draft_monitor(self, draft_metrics: dict) -> list:
+        """
+        格式化 Draft 状态监控信息为行列表。
+        
+        将 draft_metrics 中的指标格式化为可读的控制台输出行，
+        包括有效秩、槽间相似度、段间变化率、注入效果等。
+        """
+        lines = []
+        lines.append(f"\n  📊 Draft 状态监控:")
+        # 有效秩
+        if 'draft/Zd_effective_rank' in draft_metrics:
+            lines.append(f"    Z_d 有效秩: {draft_metrics['draft/Zd_effective_rank']:.2f}")
+        if 'draft/Ze_effective_rank' in draft_metrics:
+            lines.append(f"    Z_e 有效秩: {draft_metrics['draft/Ze_effective_rank']:.2f}")
+        if 'draft/T_effective_rank' in draft_metrics:
+            lines.append(f"    T 轨迹有效秩: {draft_metrics['draft/T_effective_rank']:.2f}")
+        # 槽间相似度
+        if 'draft/Zd_slot_cosim' in draft_metrics:
+            cosim = draft_metrics['draft/Zd_slot_cosim']
+            status = "✅" if cosim < 0.5 else ("⚠️" if cosim < 0.8 else "❌坍塌")
+            lines.append(f"    Z_d 槽间余弦相似度: {cosim:.4f} {status}")
+        # 段间变化率
+        if 'draft/Zd_relative_delta' in draft_metrics:
+            delta = draft_metrics['draft/Zd_relative_delta']
+            status = "✅" if 0.05 <= delta <= 0.3 else ("⚠️过小" if delta < 0.05 else "⚠️过大")
+            lines.append(f"    Z_d 段间变化率: {delta:.4f} {status}")
+        # 段间 prefix 余弦相似度
+        if 'draft/prefix_inter_seg_cosim' in draft_metrics:
+            cosim = draft_metrics['draft/prefix_inter_seg_cosim']
+            status = "✅" if 0.7 <= cosim <= 0.95 else ("⚠️不变" if cosim > 0.95 else "⚠️剧变")
+            lines.append(f"    段间 prefix 余弦相似度: {cosim:.4f} {status}")
+        # Evidence Gate β
+        if 'draft/beta_mean' in draft_metrics:
+            lines.append(f"    Evidence Gate β: "
+                  f"mean={draft_metrics['draft/beta_mean']:.4f}, "
+                  f"std={draft_metrics['draft/beta_std']:.4f}, "
+                  f"range=[{draft_metrics.get('draft/beta_min', 0):.4f}, "
+                  f"{draft_metrics.get('draft/beta_max', 0):.4f}]")
+        # 范数
+        if 'draft/Zd_norm' in draft_metrics:
+            lines.append(f"    Z_d 范数: {draft_metrics['draft/Zd_norm']:.4f}")
+
+        # ====== 多层 Draft 注入效果 ======
+        lines.append(f"\n  🎯 多层 Draft 注入效果:")
+        if 'draft/inject_norm_mean' in draft_metrics:
+            inject_norm = draft_metrics['draft/inject_norm_mean']
+            inject_ratio = draft_metrics.get('draft/inject_ratio', 0.0)
+            status = "✅生效" if inject_norm > 1e-6 else "⚠️极小"
+            lines.append(f"    注入修正量 L2 范数: {inject_norm:.6f} {status}")
+            lines.append(f"    修正/原始比: {inject_ratio:.6f}")
+        # 各层 scale 汇总
+        _scale_lines = []
+        for key in sorted(draft_metrics.keys()):
+            if key.startswith('draft/readout_scale_L'):
+                layer_num = key.split('_L')[-1]
+                _scale_lines.append(f"L{layer_num}={draft_metrics[key]:.4f}")
+        if _scale_lines:
+            lines.append(f"    各层 Readout Scale: {', '.join(_scale_lines)}")
+        if 'draft/num_steps' in draft_metrics:
+            lines.append(f"    Step 数量: {int(draft_metrics['draft/num_steps'])}")
+
+        # ====== 选择性注入权重分布 (改进3: 监控 inject_weight 分布) ======
+        if 'draft/inject_weight_mean' in draft_metrics:
+            lines.append(f"\n  🔍 选择性注入权重分布 (inject_weight):")
+            _iw_mean = draft_metrics['draft/inject_weight_mean']
+            _iw_std = draft_metrics.get('draft/inject_weight_std', 0.0)
+            _iw_min = draft_metrics.get('draft/inject_weight_min', 0.0)
+            _iw_max = draft_metrics.get('draft/inject_weight_max', 0.0)
+            lines.append(f"    均值={_iw_mean:.4f}, 标准差={_iw_std:.4f}, "
+                         f"范围=[{_iw_min:.4f}, {_iw_max:.4f}]")
+            # 分位数
+            _p10 = draft_metrics.get('draft/inject_weight_p10', 0.0)
+            _p25 = draft_metrics.get('draft/inject_weight_p25', 0.0)
+            _p50 = draft_metrics.get('draft/inject_weight_median', 0.0)
+            _p75 = draft_metrics.get('draft/inject_weight_p75', 0.0)
+            _p90 = draft_metrics.get('draft/inject_weight_p90', 0.0)
+            lines.append(f"    分位数: P10={_p10:.4f}, P25={_p25:.4f}, "
+                         f"P50={_p50:.4f}, P75={_p75:.4f}, P90={_p90:.4f}")
+            # 分桶占比 (ASCII 柱状图)
+            _b_vl = draft_metrics.get('draft/iw_bucket_very_low', 0.0)
+            _b_lo = draft_metrics.get('draft/iw_bucket_low', 0.0)
+            _b_md = draft_metrics.get('draft/iw_bucket_medium', 0.0)
+            _b_hi = draft_metrics.get('draft/iw_bucket_high', 0.0)
+            _b_vh = draft_metrics.get('draft/iw_bucket_very_high', 0.0)
+            lines.append(f"    分桶占比:")
+            lines.append(f"      [0, 0.1)  极低注入: {_b_vl*100:5.1f}% {'█' * int(_b_vl * 40)}")
+            lines.append(f"      [0.1,0.2) 低注入:   {_b_lo*100:5.1f}% {'█' * int(_b_lo * 40)}")
+            lines.append(f"      [0.2,0.5) 中注入:   {_b_md*100:5.1f}% {'█' * int(_b_md * 40)}")
+            lines.append(f"      [0.5,0.8) 高注入:   {_b_hi*100:5.1f}% {'█' * int(_b_hi * 40)}")
+            lines.append(f"      [0.8,1.0] 极高注入: {_b_vh*100:5.1f}% {'█' * int(_b_vh * 40)}")
+            # 有效训练信号评估
+            _eff = draft_metrics.get('draft/effective_signal_ratio', 0.0)
+            if _eff < 0.1:
+                _signal_status = "❌ 训练信号极稀疏! 考虑降低 min=0.05 或调整基座模型"
+            elif _eff < 0.3:
+                _signal_status = "⚠️ 训练信号偏少, draft 学习效率可能受限"
+            else:
+                _signal_status = "✅ 训练信号充足"
+            lines.append(f"    有效训练信号 (iw≥0.2): {_eff*100:.1f}% {_signal_status}")
+
+        return lines
 
     def _is_main_process(self) -> bool:
         """判断是否为主进程"""

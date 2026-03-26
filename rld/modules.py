@@ -65,7 +65,7 @@ class CrossAttentionBlock(nn.Module):
 
     def __init__(
         self,
-        d_model: int = 512,
+        d_model: int = 768,
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
@@ -161,7 +161,7 @@ class EvidenceResampler(nn.Module):
     def __init__(
         self,
 hidden_size: int = 4096,
-        d_z: int = 512,
+d_z: int = 768,
         num_evidence_slots: int = 16,
         num_heads: int = 8,
         num_layers: int = 2,
@@ -228,7 +228,7 @@ class StepResampler(nn.Module):
     def __init__(
         self,
 hidden_size: int = 4096,
-        d_z: int = 512,
+d_z: int = 768,
         num_trace_slots: int = 16,
         num_heads: int = 8,
     ):
@@ -293,7 +293,7 @@ class TraceUpdater(nn.Module):
 
     def __init__(
         self,
-        d_z: int = 512,
+d_z: int = 768,
         num_trace_slots: int = 16,
         num_heads: int = 8,
         num_layers: int = 2,
@@ -356,7 +356,7 @@ class ReflectionModule(nn.Module):
         num_layers: cross-attention 层数 (默认 2)
     """
 
-    def __init__(self, d_z: int = 512, num_heads: int = 8, num_layers: int = 2):
+    def __init__(self, d_z: int = 768, num_heads: int = 8, num_layers: int = 2):
         super().__init__()
         self.layers = nn.ModuleList([
             CrossAttentionBlock(d_model=d_z, num_heads=num_heads)
@@ -380,57 +380,126 @@ class ReflectionModule(nn.Module):
 
 class DraftUpdater(nn.Module):
     """
-    草稿更新器 (G_c 作为唯一 KV + T_c additive bias)
-    
-    用 G_c (证据校验后的推理) 更新可擦写草稿 Z^d:
-      1. U_c = CA(Q=Z^d_c, K=G_c, V=G_c)   — 主要信息来源
-      2. t_bias = Linear(MeanPool(T_c))       — 全局推理方向偏置
-      3. Z^d_{c+1} = LN((1-α_c) * Z^d_c + α_c * MLP(U_c + t_bias))
-    
-    设计动机:
-    - G_c 已包含 T_c 的核心信息 (通过 ReflectionModule 的 residual 连接)
-    - T_c 不再作为 KV 拼接 (避免单层 CA 无法区分两个信源的问题)
-    - T_c 通过 additive bias 注入全局推理方向，信号不互相干扰
-    
-    其中 α_c 是门控系数，防止每步过写。
-    
-    Args:
-        d_z: controller 空间维度
-        num_heads: cross-attention 头数
-        use_gate: 是否使用门控 (推荐 True)
+    [已弃用] 旧版门控草稿更新器，保留用于向后兼容和权重加载。
+    新代码请使用 ResidualFlowDraftUpdater。
     """
 
     def __init__(
         self,
-        d_z: int = 512,
+d_z: int = 768,
         num_heads: int = 8,
         use_gate: bool = True,
     ):
         super().__init__()
         self.d_z = d_z
         self.use_gate = use_gate
-
-        # Cross-attention: Q=Z^d, KV=G_c (只用证据校验后的推理)
         self.ca_block = CrossAttentionBlock(d_model=d_z, num_heads=num_heads)
-
-        # T_c 全局方向 bias: MeanPool → Linear → broadcast
         self.trace_bias_proj = nn.Sequential(
             RMSNorm(d_z),
             nn.Linear(d_z, d_z, bias=False),
         )
-
-        # MLP for update
         self.update_mlp = nn.Sequential(
             nn.Linear(d_z, d_z * 4, bias=False),
             nn.SiLU(),
             nn.Linear(d_z * 4, d_z, bias=False),
         )
-
-        # 门控
         if use_gate:
             self.gate_proj = nn.Linear(d_z, 1, bias=True)
-            # 初始化 bias 使初始 sigmoid ≈ 0.1 (保守更新)
             nn.init.constant_(self.gate_proj.bias, -2.2)
+        self._init_trace_bias()
+
+    def _init_trace_bias(self):
+        for module in self.trace_bias_proj.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, std=0.01)
+
+    def forward(self, Z_d, T_c, G_c):
+        param_dtype = self.ca_block.q_proj.weight.dtype
+        Z_d = Z_d.to(param_dtype)
+        T_c = T_c.to(param_dtype)
+        G_c = G_c.to(param_dtype)
+        U_c = self.ca_block(query=Z_d, key_value=G_c)
+        t_bias = self.trace_bias_proj(T_c.mean(dim=1, keepdim=True))
+        U_c = U_c + t_bias
+        update = self.update_mlp(U_c)
+        if self.use_gate:
+            alpha = torch.sigmoid(self.gate_proj(U_c))
+            Z_d_new = (1.0 - alpha) * Z_d + alpha * update
+        else:
+            Z_d_new = Z_d + update
+        max_norm = 43.0  # √(768/512) × 35 ≈ 43, 适配 d_z=768
+        slot_norms = Z_d_new.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        clamped_scale = (max_norm / slot_norms).clamp(max=1.0)
+        Z_d_new = Z_d_new * clamped_scale
+        return Z_d_new
+
+
+class ResidualFlowDraftUpdater(nn.Module):
+    """
+    Neural ODE / Residual Flow 草稿更新器
+    
+    核心公式:
+      v = v_θ(Z^d_c, T_c, G_c, t=c/C)
+      Z^d_{c+1} = Z^d_c + Δt · v
+    
+    其中 v_θ (velocity field) 内部通过 cross-attention 让 Z_d 从 G_c 读取
+    "推理与视觉相互印证"的信息，再注入时间嵌入和轨迹方向 bias。
+    
+    相比旧版 DraftUpdater 的改进:
+    1. 去掉 sigmoid 门控 → 消除对 G_c 信号 90% 的衰减
+    2. 残差步进 Z_d + Δt·v → 梯度路径无饱和区，∂Z_new/∂Z_d = I + Δt·∂v/∂Z_d
+    3. 时间嵌入 t=c/C → 让网络感知推理阶段（早期粗略印证，后期精细校验）
+    4. 信息流拓扑不变: ReflectionModule → G_c → velocity field，"相互印证"完全保留
+    
+    Args:
+        d_z: controller 空间维度 (512)
+        num_heads: cross-attention 头数 (8)
+        max_steps: 最大 step 数 C，用于计算 Δt = 1/C (默认 14)
+    """
+
+    def __init__(
+        self,
+d_z: int = 768,
+        num_heads: int = 8,
+        max_steps: int = 14,
+    ):
+        super().__init__()
+        self.d_z = d_z
+        self.max_steps = max_steps
+
+        # ====== 时间嵌入: 正弦位置编码 + MLP 投影到 d_z ======
+        # 用 64 维正弦频率编码 step 进度 t ∈ [0, 1]
+        self.time_embed_dim = 64
+        self.time_mlp = nn.Sequential(
+            nn.Linear(self.time_embed_dim, d_z, bias=False),
+            nn.SiLU(),
+            nn.Linear(d_z, d_z, bias=False),
+        )
+        # 小范围初始化，避免初始时间嵌入过大
+        for m in self.time_mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+
+        # ====== Velocity Field v_θ 的核心组件 ======
+
+        # 1. Cross-attention: Q=Z^d, KV=G_c (从 grounded trace 读取印证信息)
+        self.ca_block = CrossAttentionBlock(d_model=d_z, num_heads=num_heads)
+
+        # 2. T_c 全局方向 bias: MeanPool → Linear → broadcast
+        self.trace_bias_proj = nn.Sequential(
+            RMSNorm(d_z),
+            nn.Linear(d_z, d_z, bias=False),
+        )
+
+        # 3. Velocity MLP: 融合 CA 输出 + 时间嵌入 + 轨迹 bias → velocity
+        self.velocity_mlp = nn.Sequential(
+            RMSNorm(d_z),
+            nn.Linear(d_z, d_z * 4, bias=False),
+            nn.SiLU(),
+            nn.Linear(d_z * 4, d_z, bias=False),
+        )
+        # velocity MLP 输出初始化为小值，确保初始 velocity ≈ 0（稳定训练起步）
+        nn.init.normal_(self.velocity_mlp[-1].weight, std=0.01)
 
         self._init_trace_bias()
 
@@ -440,46 +509,80 @@ class DraftUpdater(nn.Module):
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, std=0.01)
 
+    def _sinusoidal_time_embedding(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        正弦时间嵌入 (类似 Transformer 位置编码)
+        
+        Args:
+            t: [B] 或 [B, 1] 标量时间值 ∈ [0, 1]
+        
+        Returns:
+            emb: [B, time_embed_dim] 时间嵌入向量
+        """
+        if t.dim() == 0:
+            t = t.unsqueeze(0)
+        if t.dim() == 2:
+            t = t.squeeze(-1)  # [B]
+        
+        half_dim = self.time_embed_dim // 2
+        # 频率: exp(-log(10000) * i / (half_dim - 1)), i = 0, ..., half_dim-1
+        freqs = torch.exp(
+            -math.log(10000.0) * torch.arange(half_dim, device=t.device, dtype=t.dtype) / max(half_dim - 1, 1)
+        )  # [half_dim]
+        # 外积: [B, half_dim]
+        args = t.unsqueeze(-1) * freqs.unsqueeze(0) * math.pi
+        # 拼接 sin 和 cos: [B, time_embed_dim]
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        return emb
+
     def forward(
         self,
-        Z_d: torch.Tensor,    # [B, K_d, d_z] 当前草稿
-        T_c: torch.Tensor,    # [B, K_t, d_z] 累计轨迹 (仅提供方向 bias)
-        G_c: torch.Tensor,    # [B, K_t, d_z] grounded trace (主 KV)
+        Z_d: torch.Tensor,       # [B, K_d, d_z] 当前草稿
+        T_c: torch.Tensor,       # [B, K_t, d_z] 累计轨迹 (提供方向 bias)
+        G_c: torch.Tensor,       # [B, K_t, d_z] grounded trace (主 KV)
+        step_progress: float = 0.0,  # t = c/C ∈ [0, 1], 当前推理进度
     ) -> torch.Tensor:
         """
+        Residual Flow 更新: Z^d_{c+1} = Z^d_c + Δt · v_θ(Z^d_c, T_c, G_c, t)
+        
         Returns:
             Z_d_new: [B, K_d, d_z] 更新后的草稿
         """
-        # 统一 dtype（DeepSpeed ZeRO 下权重可能是 bf16，输入可能是 fp32）
+        B = Z_d.shape[0]
         param_dtype = self.ca_block.q_proj.weight.dtype
         Z_d = Z_d.to(param_dtype)
         T_c = T_c.to(param_dtype)
         G_c = G_c.to(param_dtype)
 
-        # Cross-attention: 旧草稿只从 G_c (证据校验后的推理) 中读取
+        # ====== 1. 时间嵌入 ======
+        t_val = torch.tensor([step_progress], device=Z_d.device, dtype=param_dtype).expand(B)
+        t_emb_raw = self._sinusoidal_time_embedding(t_val)  # [B, time_embed_dim]
+        t_emb = self.time_mlp(t_emb_raw)  # [B, d_z]
+        t_emb = t_emb.unsqueeze(1)  # [B, 1, d_z], 广播到所有 slot
+
+        # ====== 2. Cross-attention: Z_d 从 G_c 读取印证信息 ======
+        # G_c 是 ReflectionModule(T_c, Z_e) 的输出，承载了"推理×视觉交叉验证"
         U_c = self.ca_block(query=Z_d, key_value=G_c)  # [B, K_d, d_z]
 
-        # T_c 全局方向 bias: mean pooling → 投影 → broadcast 到每个 slot
+        # ====== 3. T_c 全局方向 bias ======
         t_bias = self.trace_bias_proj(T_c.mean(dim=1, keepdim=True))  # [B, 1, d_z]
-        U_c = U_c + t_bias  # 加性注入推理方向
 
-        # MLP
-        update = self.update_mlp(U_c)  # [B, K_d, d_z]
+        # ====== 4. 融合: CA输出 + 时间嵌入 + 轨迹bias ======
+        # 加性融合: U_c 已经是 Z_d 的残差 (CA block 内部有残差连接)
+        # 时间嵌入和轨迹 bias 作为条件调制
+        combined = U_c + t_emb + t_bias  # [B, K_d, d_z]
 
-        if self.use_gate:
-            # 门控: α_c = sigmoid(W_α · Pool(U_c))
-            # 对每个 slot 独立计算门控
-            alpha = torch.sigmoid(self.gate_proj(U_c))  # [B, K_d, 1]
-            # 注意: 不使用 RMSNorm, 因为归一化会把 slot 间的范数差异抹平, 加速坍塌
-            Z_d_new = (1.0 - alpha) * Z_d + alpha * update
-        else:
-            Z_d_new = Z_d + update
+        # ====== 5. Velocity MLP → v_θ ======
+        velocity = self.velocity_mlp(combined)  # [B, K_d, d_z]
 
-        # 软范数裁剪: 限制每个 slot 的最大范数, 防止多 step 累积后范数爆炸
-        # 但不做归一化 (保留 slot 间的范数差异, 避免坍塌)
-        max_norm = 35.0
+        # ====== 6. 残差步进: Z_d + Δt · v ======
+        # Δt = 1 / max_steps, 确保多步累积后总位移在合理范围
+        dt = 1.0 / self.max_steps
+        Z_d_new = Z_d + dt * velocity
+
+        # ====== 7. 软范数裁剪 (防止累积爆炸，保留 slot 间范数差异) ======
+        max_norm = 43.0  # √(768/512) × 35 ≈ 43, 适配 d_z=768
         slot_norms = Z_d_new.norm(dim=-1, keepdim=True).clamp(min=1e-8)  # [B, K_d, 1]
-        # 只裁剪超过 max_norm 的 slot, 其余不变
         clamped_scale = (max_norm / slot_norms).clamp(max=1.0)
         Z_d_new = Z_d_new * clamped_scale
 
@@ -554,7 +657,7 @@ class DraftReadoutAdapter(nn.Module):
     def __init__(
         self,
         hidden_size: int = 3584,
-        d_z: int = 512,
+d_z: int = 768,
         num_heads: int = 8,
     ):
         super().__init__()
@@ -585,6 +688,12 @@ class DraftReadoutAdapter(nn.Module):
         # 从 0.1 → 1.0，配合 std=0.02 使初始修正量从 ~10^{-7} 提升到 ~10^{-4}
         self.scale = nn.Parameter(torch.tensor(1.0))
 
+        # 自适应范数比约束参数: 基座越不确定 → 允许越大的修正量
+        # base_ratio: 基座 100% 确定时的最低修正上限 (inject_weight ≈ 0.05)
+        # max_ratio: 基座完全不确定时的最高修正上限 (inject_weight ≈ 1.0)
+        self._adaptive_ratio_base = 0.08   # 8%: 基座确定时仅允许微弱修正
+        self._adaptive_ratio_max = 0.30    # 30%: 基座犯错时允许充分修正
+
         self._init_weights()
 
     def _init_weights(self):
@@ -597,11 +706,15 @@ class DraftReadoutAdapter(nn.Module):
         self,
         hidden_states: torch.Tensor,  # [B, T, hidden_size] 冻结 base model 的 hidden
         draft_states: torch.Tensor,    # [B, T, K_d, d_z] 每个 token 对应的 draft state
+        inject_weight: torch.Tensor = None,  # [B, T, 1] token 级注入权重 (选择性注入)
     ) -> torch.Tensor:
         """
         Args:
             hidden_states: [B, T, hidden_size] — 冻结 base model 最后一层的 hidden
             draft_states: [B, T, K_d, d_z] — 每个 token 位置对应的 step-level draft
+            inject_weight: [B, T, 1] — 可选, token 级注入权重 (0~1)
+                           基座越确定的 token 权重越小, 越不确定的权重越大
+                           None 时等价于全 1.0 (不做选择性注入)
         
         Returns:
             adapted_hidden: [B, T, hidden_size] — 适配后的 hidden (可直接过 lm_head)
@@ -643,7 +756,59 @@ class DraftReadoutAdapter(nn.Module):
         # 6. 投影回 hidden_size 并残差连接
         adaptation = self.out_proj_up(attn_output)  # [B, T, hidden_size]
         adaptation = self.out_norm(adaptation)
-        adapted_hidden = hidden_states + self.scale * adaptation
+
+        # Scale 软约束: 使用 clamp 防止极端值, 但主要靠 L2 正则化 (在 loss 中)
+        _max_scale = getattr(self, '_max_scale', None)
+        if _max_scale is not None:
+            clamped_scale = self.scale.clamp(max=_max_scale)
+        else:
+            clamped_scale = self.scale
+
+        # 修正量 = scale * adaptation
+        delta = clamped_scale * adaptation  # [B, T, hidden_size]
+
+        # ====== 自适应范数比约束: 基座越不确定 → 允许越大的修正量 ======
+        # 旧方案: 固定 15% 上限, 与选择性注入串联叠加导致实际修正量被过度压缩
+        # 新方案: max_ratio_per_token = base_ratio + (max_ratio - base_ratio) × inject_weight
+        #   - 基座确定 (inject_weight ≈ 0.05): max_ratio ≈ 8%, 非常保守
+        #   - 基座不确定 (inject_weight ≈ 0.95): max_ratio ≈ 29%, 充分修正
+        # 两个约束协同工作: 选择性注入决定"要不要修", 范数比约束决定"修多少"
+        _base_ratio = getattr(self, '_adaptive_ratio_base', 0.08)
+        _max_ratio = getattr(self, '_adaptive_ratio_max', 0.30)
+
+        with torch.no_grad():
+            delta_norm = delta.norm(dim=-1, keepdim=True).clamp(min=1e-8)  # [B, T, 1]
+            hidden_norm = hidden_states.norm(dim=-1, keepdim=True).clamp(min=1e-8)  # [B, T, 1]
+            ratio = delta_norm / hidden_norm  # [B, T, 1]
+
+            if inject_weight is not None:
+                # 自适应上限: 根据 inject_weight 线性插值
+                # inject_weight: [B, T, 1], 范围 [0.05, 1.0]
+                _iw = inject_weight.to(delta.dtype)
+                adaptive_max_ratio = _base_ratio + (_max_ratio - _base_ratio) * _iw  # [B, T, 1]
+            else:
+                # 无选择性注入时, 使用保守的固定上限 (介于 base 和 max 之间)
+                adaptive_max_ratio = (_base_ratio + _max_ratio) / 2.0  # 标量 19%
+
+            # 只对超过自适应上限的 token 做缩放, 不影响正常范围内的修正
+            shrink = (adaptive_max_ratio / ratio).clamp(max=1.0)  # [B, T, 1], ≤1.0
+        delta = delta * shrink  # 保留梯度 (shrink 是 no_grad 的常量)
+
+        # ====== 选择性注入: 在 adapter 内部直接做 token 级加权 ======
+        # inject_weight 由 model.py 根据基座置信度计算并传入
+        # 基座越确定的 token → 权重越小 → 修正量越小 (源头控制, 而非事后衰减)
+        # 注意: 自适应范数比约束已经考虑了 inject_weight, 这里的乘法是额外的源头控制
+        # 两者协同: 范数比约束限制"修正量上限", 选择性注入控制"实际注入比例"
+        #
+        # ★ 使用 sqrt(inject_weight) 缓和二次方衰减:
+        # 范数比约束已经用了 inject_weight 做自适应上限, 如果选择性注入再乘一次原始值,
+        # 实际修正量 ∝ inject_weight² (二次方衰减), 导致中等不确定度的 token 修正量过小。
+        # 例如 inject_weight=0.1 时: 原方案实际修正 ≈ 1%, 改用 sqrt 后 ≈ 3.2%
+        # 这让 draft 在基座"有点犹豫"的位置也能提供有意义的辅助。
+        if inject_weight is not None:
+            delta = delta * inject_weight.to(delta.dtype).sqrt()  # [B, T, hidden_size]
+
+        adapted_hidden = hidden_states + delta
 
         return adapted_hidden
 
@@ -676,7 +841,7 @@ class MultiLayerDraftReadout(nn.Module):
     def __init__(
         self,
         hidden_size: int = 3584,
-        d_z: int = 512,
+d_z: int = 768,
         num_heads: int = 8,
         total_layers: int = 36,
         readout_layer_indices: list = None,
@@ -868,3 +1033,198 @@ class MultiLayerDraftReadout(nn.Module):
         """
         # 使用最后一层的 adapter (scale 最大，影响最显著)
         return self.adapters[-1](hidden_states, draft_states)
+
+
+class InSituDraftInjector(nn.Module):
+    """
+    In-Situ Draft 注入器 (Top-K Rerun 方案)
+    
+    核心思想: 在 Pass 2 中重算最后 K 层 decoder layers，在指定注入点插入 DraftReadoutAdapter。
+    修正后的 hidden state 继续参与后续层的 self-attention（KV 被真正改写）。
+    
+    这解决了 post-hoc 方案的根本问题:
+    - post-hoc: h̃_t = h_t + adapter(h_t, Z_d), 但 h_{t+1} 从未见过 h̃_t
+    - in-situ: 修正后的 h̃_t 进入后续层的 self-attention KV, h_{t+1} 能看到修正后的上下文
+    
+    Phase 1: K=1 (仅最后一层 rerun + 注入), 验证管线通畅
+    Phase 2: K=8 (重算最后 8 层, 注入 L28+L35), 真正因果一致
+    Phase 3: K=8, 3 注入点 (L28+L31+L35), 完整方案
+    
+    训练时: Pass 1 (no_grad, 36层) → Controller → Pass 2 (有梯度, 最后K层 rerun + adapter注入)
+    推理时: register_forward_hook 在注入层自动修正 hidden (KV cache 自然包含修正值)
+    
+    Args:
+        hidden_size: 基座模型隐藏维度 (4096 for Qwen3-VL-8B)
+        d_z: controller 空间维度 (512)
+        num_heads: cross-attention 头数
+        total_layers: 基座模型总层数 (36)
+        rerun_k: 重算的层数 K (Phase 1: K=1, Phase 2+: K=8)
+        injection_offsets: 在 rerun 的 K 层中的注入偏移量列表
+                           Phase 1: [0] (仅最后一层)
+                           Phase 2: [0, K-1]
+                           Phase 3: [0, K//2-1, K-1]
+    """
+
+    def __init__(
+        self,
+        hidden_size: int = 4096,
+d_z: int = 768,
+        num_heads: int = 8,
+        total_layers: int = 36,
+        rerun_k: int = 1,
+        injection_offsets: list = None,
+        max_scale: float = 0.3,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.d_z = d_z
+        self.total_layers = total_layers
+        self.rerun_k = rerun_k
+        self.rerun_start = total_layers - rerun_k  # Phase 1: 35, Phase 2+: 28
+        self.max_scale = max_scale  # Scale 上界约束
+
+        # 注入点: 在重算的 K 层中选取
+        if injection_offsets is None:
+            if rerun_k == 1:
+                injection_offsets = [0]  # 仅最后一层
+            else:
+                injection_offsets = [0, rerun_k - 1]  # 首尾两层
+        self.injection_offsets = injection_offsets
+        self.injection_layer_indices = [self.rerun_start + off for off in injection_offsets]
+
+        # 为每个注入层创建独立的 DraftReadoutAdapter
+        self.adapters = nn.ModuleDict({
+            str(idx): DraftReadoutAdapter(hidden_size, d_z, num_heads)
+            for idx in self.injection_layer_indices
+        })
+
+        # 渐进式 scale 初始化: 从较小值开始，让 adapter 逐步学习修正量
+        # 旧值 [0.3, 0.65, 1.0] 导致修正/原始比高达 0.83，严重干扰基座模型
+        # 新值 [0.10, 0.15, 0.20] 确保初始修正量约为原始 hidden 的 10%~20%
+        n = len(self.injection_layer_indices)
+        if n == 1:
+            scales = [0.15]
+        else:
+            scales = [0.10 + 0.10 * i / (n - 1) for i in range(n)]
+        for i, idx in enumerate(self.injection_layer_indices):
+            self.adapters[str(idx)].scale = nn.Parameter(torch.tensor(scales[i]))
+            # 将 max_scale 传递给每个 adapter, 用于 forward 中的 clamp
+            self.adapters[str(idx)]._max_scale = max_scale
+
+        # 调试计数器
+        self._debug_fwd_count = 0
+
+    @property
+    def scale(self):
+        """返回最后一个注入点 adapter 的 scale (兼容旧接口的监控代码)"""
+        last_idx = str(self.injection_layer_indices[-1])
+        return self.adapters[last_idx].scale
+
+    @property
+    def layer_indices(self):
+        """兼容 MultiLayerDraftReadout 的接口"""
+        return self.injection_layer_indices
+
+    def inject(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,    # [B, T, hidden_size]
+        Z_d_expanded: torch.Tensor,     # [B, T, K_d, d_z]
+        inject_weight: torch.Tensor = None,  # [B, T, 1] token 级注入权重 (选择性注入)
+    ) -> torch.Tensor:
+        """
+        在指定层执行 in-situ adapter 注入 (支持源头选择性注入)
+        
+        如果 layer_idx 不是注入层, 直接返回原始 hidden_states (无修改)。
+        如果是注入层, 返回 adapter(hidden_states, Z_d_expanded, inject_weight)。
+        
+        inject_weight 由 model.py 根据基座置信度计算:
+        - 基座确定的 token → 权重小 → adapter 修正量被压缩 (源头控制)
+        - 基座不确定的 token → 权重大 → adapter 充分修正
+        
+        Args:
+            layer_idx: 当前 decoder layer 的索引 (0~35)
+            hidden_states: [B, T, hidden_size] 当前层的输出
+            Z_d_expanded: [B, T, K_d, d_z] token 级 draft state
+            inject_weight: [B, T, 1] 可选, token 级注入权重
+        
+        Returns:
+            hidden_states: [B, T, hidden_size] (注入后的, 或原始的)
+        """
+        key = str(layer_idx)
+        if key in self.adapters:
+            return self.adapters[key](hidden_states, Z_d_expanded, inject_weight=inject_weight)
+        return hidden_states
+
+    def inject_single_token(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,    # [B, 1, hidden_size]
+        draft_states: torch.Tensor,     # [B, 1, K_d, d_z]
+        inject_weight: torch.Tensor = None,  # [B, 1, 1] token 级注入权重 (推理时选择性注入)
+    ) -> torch.Tensor:
+        """
+        推理时的单 token in-situ 注入 (用于 forward hook)
+        
+        支持选择性注入: 推理时也可传入 inject_weight, 保证训推一致。
+        
+        Args:
+            layer_idx: decoder layer 索引
+            hidden_states: [B, 1, hidden_size]
+            draft_states: [B, 1, K_d, d_z]
+            inject_weight: [B, 1, 1] 可选, token 级注入权重
+        
+        Returns:
+            hidden_states: [B, 1, hidden_size]
+        """
+        key = str(layer_idx)
+        if key in self.adapters:
+            return self.adapters[key](hidden_states, draft_states, inject_weight=inject_weight)
+        return hidden_states
+
+    def forward(
+        self,
+        all_hidden_states: tuple,
+        last_hidden_state: torch.Tensor,
+        draft_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        兼容 MultiLayerDraftReadout 的 forward 接口 (用于不需要 rerun 的场景)
+        
+        注意: 在 Top-K Rerun 模式下, 这个方法通常不会被调用。
+        真正的注入发生在 model.py 的 Pass 2 循环中通过 self.inject() 调用。
+        
+        此方法仅作为 fallback / 兼容层保留。
+        """
+        B, T, H = last_hidden_state.shape
+        param_dtype = self.adapters[str(self.injection_layer_indices[-1])].q_proj.weight.dtype
+        adapted_hidden = last_hidden_state.to(param_dtype)
+
+        for layer_idx in self.injection_layer_indices:
+            adapter = self.adapters[str(layer_idx)]
+            # 注入: 提取纯 adaptation 量 (adapter 内部做了 h + scale*adapt, 所以减去 h)
+            if all_hidden_states is not None and all_hidden_states[layer_idx + 1] is not None:
+                h_l = all_hidden_states[layer_idx + 1]
+            else:
+                h_l = last_hidden_state
+            adaptation_l = adapter(h_l, draft_states) - h_l.to(param_dtype)
+            adapted_hidden = adapted_hidden + adaptation_l
+
+        return adapted_hidden
+
+    def forward_single_token(
+        self,
+        hidden_states: torch.Tensor,    # [B, 1, hidden_size]
+        draft_states: torch.Tensor,     # [B, 1, K_d, d_z]
+        inject_weight: torch.Tensor = None,  # [B, 1, 1] token 级注入权重 (推理时选择性注入)
+    ) -> torch.Tensor:
+        """
+        推理时的单 token forward (兼容 MultiLayerDraftReadout 的接口)
+        
+        在推理路径使用 forward hook 时, 此方法不会被直接调用。
+        但为了 prefill 阶段的兼容性 (还没注册 hook 时), 保留此接口。
+        支持选择性注入: 传入 inject_weight 保证训推一致。
+        """
+        # 使用最后一个注入点的 adapter
+        last_idx = str(self.injection_layer_indices[-1])
+        return self.adapters[last_idx](hidden_states, draft_states, inject_weight=inject_weight)

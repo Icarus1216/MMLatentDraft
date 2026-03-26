@@ -155,7 +155,7 @@ def main():
     model_kwargs = dict(
         model_path=model_config['model_path'],
         hidden_size=model_config.get('hidden_size', 4096),
-        d_z=rld_config.get('d_z', 512),
+        d_z=rld_config.get('d_z', 768),
         num_evidence_slots=rld_config.get('num_evidence_slots', 16),
         num_draft_slots=rld_config.get('num_draft_slots', 16),
         num_trace_slots=rld_config.get('num_trace_slots', 16),
@@ -163,6 +163,9 @@ def main():
         torch_dtype=getattr(torch, model_config.get('torch_dtype', 'bfloat16')),
         attn_implementation=model_config.get('attn_implementation', 'flash_attention_2'),
         lambda_div=rld_config.get('lambda_div', 0.01),
+        lambda_kl=rld_config.get('lambda_kl', 0.1),
+        max_scale=rld_config.get('max_scale', 0.3),
+        selective_injection=rld_config.get('selective_injection', True),
     )
 
     # 注意: 不使用 deepspeed.zero.Init() 手动包裹模型创建。

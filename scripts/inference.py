@@ -52,7 +52,7 @@ class RLDInference:
         # 模型参数
         hidden_size: int = 4096,
         # RLD 参数
-        d_z: int = 512,
+        d_z: int = 768,
         num_evidence_slots: int = 16,
         num_draft_slots: int = 16,
         num_trace_slots: int = 16,

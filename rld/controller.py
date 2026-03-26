@@ -21,6 +21,7 @@ from .modules import (
     TraceUpdater,
     ReflectionModule,
     DraftUpdater,
+    ResidualFlowDraftUpdater,
     DiversityRegularizer,
     RMSNorm,
 )
@@ -44,22 +45,24 @@ class RLDController(nn.Module):
         total_layers: 基座模型总层数 (36 for Qwen3-VL-8B)
         num_heads: cross-attention 头数 (默认 8)
         evidence_layers: evidence resampler 的层数 (默认 2)
-        use_gate: 草稿更新是否使用门控 (默认 True)
+        use_gate: [已废弃] 保留用于兼容旧配置
         lambda_div: 多样性正则化权重 (默认 0.01)
+        max_steps: 最大 step 数, 用于 ResidualFlowDraftUpdater 的 Δt 计算 (默认 14)
     """
 
     def __init__(
         self,
         hidden_size: int = 4096,
-        d_z: int = 512,
+        d_z: int = 768,
         num_evidence_slots: int = 16,
         num_draft_slots: int = 16,
         num_trace_slots: int = 16,
         total_layers: int = 36,
         num_heads: int = 8,
         evidence_layers: int = 2,
-        use_gate: bool = True,
+        use_gate: bool = True,  # [已废弃] 保留用于兼容旧配置, 不再使用
         lambda_div: float = 0.01,
+        max_steps: int = 14,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -69,6 +72,7 @@ class RLDController(nn.Module):
         self.K_t = num_trace_slots
         self.total_layers = total_layers
         self.lambda_div = lambda_div
+        self.max_steps = max_steps
 
         # ====== 核心模块 ======
 
@@ -104,11 +108,12 @@ class RLDController(nn.Module):
             num_layers=2,
         )
 
-        # 5. 草稿更新器: (Z^d, G_c) → Z^d_{c+1}，T_c 仅提供全局方向 bias
-        self.draft_updater = DraftUpdater(
+        # 5. 草稿更新器 (Neural ODE / Residual Flow): (Z^d, T_c, G_c, t) → Z^d_{c+1}
+        #    替代旧版门控 DraftUpdater, 去掉 sigmoid 衰减, 用残差步进
+        self.draft_updater = ResidualFlowDraftUpdater(
             d_z=d_z,
             num_heads=num_heads,
-            use_gate=use_gate,
+            max_steps=max_steps,
         )
 
         # ====== 初始化相关 ======
@@ -211,8 +216,10 @@ class RLDController(nn.Module):
         # 3. 回看-验证 (2层CA): (T_c, Z^e) → G_c
         G_c = self.reflection(T_c, Z_e)  # [B, K_t, d_z]
 
-        # 4. 草稿更新: KV=G_c, T_c 仅提供全局方向 bias
-        Z_d_new = self.draft_updater(Z_d, T_c, G_c)  # [B, K_d, d_z]
+        # 4. 草稿更新: Residual Flow step
+        #    传入 step_progress, 让 updater 感知推理阶段
+        step_progress = state['step_count'] / max(self.max_steps, 1)
+        Z_d_new = self.draft_updater(Z_d, T_c, G_c, step_progress=step_progress)  # [B, K_d, d_z]
 
         # P0-3: 根据 update_mask 选择性更新
         if update_mask is not None:
@@ -288,8 +295,10 @@ class RLDController(nn.Module):
             # 2. 回看-验证 (2层CA): (T_c, Z^e) → G_c
             G_c = self.reflection(T_c, Z_e)
 
-            # 3. 草稿更新: KV=G_c, T_c 仅提供全局方向 bias
-            Z_d_new = self.draft_updater(Z_d, T_c, G_c)
+            # 3. 草稿更新: Residual Flow step
+            #    传入 step_progress = c / max(C, 1), 让 updater 感知推理阶段
+            step_progress = c / max(len(step_summaries), 1)
+            Z_d_new = self.draft_updater(Z_d, T_c, G_c, step_progress=step_progress)
 
             # 4. 根据 update_mask 选择性更新
             if mask is not None:
