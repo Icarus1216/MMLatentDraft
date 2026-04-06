@@ -12,9 +12,25 @@ data/SPAR-7M/
 data/ViRL39K/
 data/clevr-math/
 
-# 大型 JSON 数据文件（>100MB）
+# 大型 JSON 数据文件
 data/rld_mmathcot_filtered.json
 data/rld_mmathcot_filtered_checked.json
+data/*.json
+*.json
+!configs/*.yaml
+
+# 大型目录
+data/rejection_sampling/
+transformers/
+verl/
+
+# 备份文件
+*.bak
+*.bak_*
+
+# 测试结果
+test_results_*.json
+test_results_*.txt
 
 # 训练输出
 outputs/

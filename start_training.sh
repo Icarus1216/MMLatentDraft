@@ -62,23 +62,6 @@ export RLD_DEBUG=0
 # 创建输出目录
 mkdir -p outputs/rld_train
 
-# ===== 数据预过滤: 检查图片存在性 =====
-# 仅在过滤后文件不存在时执行，避免重复检查
-DATA_INPUT="data/rld_mmathcot_filtered.json"
-DATA_CHECKED="data/rld_mmathcot_filtered_checked.json"
-
-if [ ! -f "$DATA_CHECKED" ]; then
-    echo "🔍 首次运行: 执行数据预过滤 (检查图片存在性)..."
-    python scripts/prefilter_data.py \
-        --input "$DATA_INPUT" \
-        --output "$DATA_CHECKED" \
-        --num_workers 32
-    echo ""
-else
-    echo "✅ 预过滤数据已存在: $DATA_CHECKED (跳过)"
-    echo ""
-fi
-
 # 分布式后端选择:
 #   默认: torchrun (PyTorch DDP) — 通信简单, 只需 1 次 allreduce 同步 61M 可训练参数
 #   可选: DeepSpeed ZeRO-2 — 设置 USE_DEEPSPEED=1 启用 (显存不是瓶颈时不推荐)

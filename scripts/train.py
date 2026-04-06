@@ -122,6 +122,7 @@ def main():
         system_prompt=data_config.get('system_prompt', None),
         max_seq_len=data_config.get('max_seq_len', 4096),
         skip_image_check=data_config.get('skip_image_check', False),
+        hard_sample_max_ratio=data_config.get('hard_sample_max_ratio', 0.22),
     )
     if is_main:
         print(f"训练样本数: {len(train_dataset)}")
@@ -136,6 +137,7 @@ def main():
             system_prompt=data_config.get('system_prompt', None),
             max_seq_len=data_config.get('max_seq_len', 4096),
             skip_image_check=data_config.get('skip_image_check', False),
+            hard_sample_max_ratio=1.0,  # eval 不下采样
         )
         if is_main:
             print(f"评估样本数: {len(eval_dataset)}")
@@ -163,9 +165,10 @@ def main():
         torch_dtype=getattr(torch, model_config.get('torch_dtype', 'bfloat16')),
         attn_implementation=model_config.get('attn_implementation', 'flash_attention_2'),
         lambda_div=rld_config.get('lambda_div', 0.01),
-        lambda_kl=rld_config.get('lambda_kl', 0.1),
         max_scale=rld_config.get('max_scale', 0.3),
         selective_injection=rld_config.get('selective_injection', True),
+        use_trace_updater=rld_config.get('use_trace_updater', True),
+        use_bidirectional_reflection=rld_config.get('use_bidirectional_reflection', False),
     )
 
     # 注意: 不使用 deepspeed.zero.Init() 手动包裹模型创建。
@@ -173,6 +176,38 @@ def main():
     # from_pretrained 内部会检测 DeepSpeed 环境并正确加载模型。
     model = RLDModel(**model_kwargs)
     model.set_processor(processor)
+
+    # ====== Stage 2: 配置 LoRA (必须在 load_pretrained 之前, 避免结构不兼容) ======
+    lora_config = rld_config.get('lora', None)
+    skip_lora_loading = rld_config.get('skip_lora_loading', False)
+    if lora_config and lora_config.get('enabled', False):
+        # 解析 LoRA 层范围: 支持 layers (精确列表) 或 layers_from (起始层)
+        lora_layers = lora_config.get('layers', None)
+        if lora_layers is None and lora_config.get('layers_from') is not None:
+            # layers_from: 从指定层到最后一层 (例如 layers_from=9 → [9,10,...,35])
+            layers_from = lora_config['layers_from']
+            total_layers = model_config.get('total_layers', 36)
+            lora_layers = list(range(layers_from, total_layers))
+            if is_main:
+                print(f"[RLD Stage 2] LoRA 层范围: L{layers_from}~L{total_layers-1} ({len(lora_layers)} 层)")
+        
+        model.setup_lora(
+            lora_r=lora_config.get('r', 16),
+            lora_alpha=lora_config.get('alpha', 32),
+            lora_dropout=lora_config.get('dropout', 0.05),
+            target_modules=lora_config.get('target_modules', None),
+            lora_layers=lora_layers,
+        )
+
+    # ====== Stage 2: 从 Stage 1 checkpoint 加载 Controller + PrefixKVProjector ======
+    resume_rld = rld_config.get('resume_from_rld_checkpoint', None)
+    if resume_rld and os.path.exists(resume_rld):
+        model.load_pretrained(resume_rld, skip_lora=skip_lora_loading)
+        if is_main:
+            if skip_lora_loading:
+                print(f"[RLD Stage 2] ✅ 从 Stage 1 加载 Controller + PrefixKVProjector (跳过旧 LoRA): {resume_rld}")
+            else:
+                print(f"[RLD Stage 2] ✅ 从 Stage 1 checkpoint 加载: {resume_rld}")
 
     if is_main:
         # ZeRO-3 下 p.numel() 返回分片大小，需要特殊处理
@@ -232,9 +267,12 @@ def main():
         remove_unused_columns=False,
         # 分布式后端: DDP 或 DeepSpeed (由 --use_deepspeed 参数控制)
         deepspeed=ds_config_path if use_deepspeed else None,
-        # DDP 配置: 冻结了 8.77B 基座参数，需要设置 find_unused_parameters=False
-        # (所有可训练参数都参与 forward, 不需要额外查找未使用参数)
-        ddp_find_unused_parameters=False,
+        # DDP 配置: RLD 的计算图是数据依赖的 (不同样本 step 数量不同),
+        # 当某些样本没有 step boundary 时, trace_updater/reflection/draft_updater 等
+        # 模块不会被调用, 其参数不参与 loss → DDP reduction 失败。
+        # 此外 streaming_accumulator 仅用于推理, 训练时永远不参与 forward。
+        # 必须设置 find_unused_parameters=True 让 DDP 自动处理。
+        ddp_find_unused_parameters=True,
         report_to=["tensorboard"],
         seed=seed,
         ddp_timeout=1800,  # DDP 超时 (默认)
@@ -243,6 +281,9 @@ def main():
     # ====== 6. 创建 Trainer ======
     if is_main:
         print("\n[5/5] 创建 Trainer...")
+    # LoRA 学习率: 从 training 配置中读取, 如果未配置则使用 controller_lr * 0.3
+    _lora_lr = training_config.get('lora_lr', None)
+    
     trainer = RLDTrainer(
         model=model,
         args=training_args,
@@ -250,6 +291,7 @@ def main():
         eval_dataset=eval_dataset,
         data_collator=collator,
         controller_lr=training_config.get('controller_lr', 1e-4),
+        lora_lr=_lora_lr,
         monitor_every_n_steps=training_config.get('monitor_every_n_steps', 50),
     )
 

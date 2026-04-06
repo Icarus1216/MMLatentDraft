@@ -1,0 +1,103 @@
+# RLD Stage 2 训练配置 (方案 B: 全模块 LoRA + 扩展到更低层)
+#
+# 在 Stage 1 bidirection 基础上:
+#   1. LoRA: L9~L35 全层, 7 个 target modules (q/k/v/o_proj + gate/up/down_proj), r=32
+#   2. 数据: ~80K 样本 (Stage 1 50K + Stage 2 checked 59K 合并去重)
+#   3. 学习率: Controller=2e-5 (微调), LoRA=5e-6 (极小, 防灾难性遗忘)
+#   4. 放松约束: lambda_div=0.05, max_scale=0.5
+#   5. 从 Stage 1 bidirection checkpoint 加载 Controller + PrefixKVProjector
+#   6. LoRA 从头初始化 (结构不同, 不加载 Stage 1 LoRA 权重)
+#
+# 可训练参数估算:
+#   - Controller: ~25M
+#   - PrefixKVProjector: ~9M
+#   - LoRA (27层 × 7模块 × r32): ~155M
+#   - 总计: ~189M (~2.3% 基座 8.3B)
+
+# 基座模型配置 (不变)
+model:
+  model_path: "/mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/for_lucas_Qwen3-VL-8B-Instruct_export"
+  hidden_size: 4096
+  total_layers: 36
+  torch_dtype: "bfloat16"
+  attn_implementation: "flash_attention_2"
+
+# RLD Controller 配置
+rld:
+  d_z: 768
+  num_evidence_slots: 16
+  num_draft_slots: 16
+  num_trace_slots: 16
+  
+  # 正则化 (放松约束, Stage 1 已解决坍塌问题)
+  lambda_div: 0.05              # ← Stage 1: 0.1 → Stage 2: 0.05
+  max_scale: 0.5                # ← Stage 1: 0.3 → Stage 2: 0.5 (允许更大修正量)
+  selective_injection: true
+  
+  # 与 Stage 1 一致的架构选项
+  use_trace_updater: false
+  use_bidirectional_reflection: true
+  
+  # ★ Stage 2: 从 Stage 1 bidirection checkpoint 加载 Controller + PrefixKVProjector
+  # 注意: 只加载 Controller 和 PrefixKVProjector, 不加载旧 LoRA (结构不兼容)
+  resume_from_rld_checkpoint: "./outputs/rld_kv_prefix_768_bidirection_stage1/model"
+  skip_lora_loading: true       # ★ 跳过旧 LoRA 加载 (Stage 2 LoRA 结构不同, 从头初始化)
+  
+  # ★ Stage 2 LoRA 配置 (方案 B: 全模块 + 扩展到更低层)
+  lora:
+    enabled: true
+    r: 32                        # ← Stage 1: 16 → Stage 2: 32 (提升表达力)
+    alpha: 64                    # alpha/r = 2 (标准缩放)
+    dropout: 0.05
+    target_modules:              # ★ 7 个模块 (全面放开 attention + FFN)
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+    layers_from: 9               # ★ L9~L35 (27层, 覆盖 75% decoder)
+                                  # 低层 (L9~L17) 学习更好的特征表示
+                                  # 中高层 (L18~L35) 与 prefix KV 注入协同
+
+# 数据配置
+data:
+  # ★ Stage 2 合并数据: ~80K 样本 (Stage 1 50K + Stage 2 checked 59K 去重合并)
+  train_json: "/mnt/cephszjt/user_juntianzhang/LatentDraft/data/rld_stage2_merged.json"
+  
+  auto_split_steps: true
+  skip_image_check: true
+  min_pixels: 3136
+  max_pixels: 1003520
+  max_seq_len: 2048
+  hard_sample_max_ratio: 0.15    # 减少极难样本比例
+  use_system_prompt: true
+
+# 训练配置
+training:
+  output_dir: "./outputs/rld_stage2_full_lora"
+  
+  num_epochs: 2                  # 2 epochs (80K × 2 = 160K 有效样本)
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 4  # 有效 batch = 1 × 4 × 8GPU = 32
+  
+  # ★ 学习率策略: 三组差异化
+  learning_rate: 2.0e-5          # 全局 (TrainingArguments 需要)
+  controller_lr: 2.0e-5          # Controller + PrefixKVProjector (从 Stage 1 微调, 比 Stage 1 小 5×)
+  lora_lr: 5.0e-5                # LoRA (适中, 平衡学习速度与稳定性)
+  
+  weight_decay: 0.01
+  warmup_steps: 200              # 更多 warmup (数据量更大, 新 LoRA 需要预热)
+  max_grad_norm: 1.0
+  
+  logging_steps: 20
+  monitor_every_n_steps: 50
+  save_steps: 500
+  save_total_limit: 5
+  eval_steps: 500
+  num_workers: 4
+  report_to: ["tensorboard"]
+
+seed: 42

@@ -2,10 +2,12 @@
 # 面向 Qwen3-VL-8B-Instruct 的步级"回看-验证"隐空间草稿
 #
 # 核心设计:
-#   - 冻结 Qwen3-VL 全部参数
-#   - 只训练 RLD Controller + ReadoutAdapter (< 30M 参数)
-#   - 通过 ReadoutAdapter 将 draft 注入 frozen hidden states
-#   - 在 </step> 边界触发 "回看-验证" 更新
+#   - 基座 L0~L17 冻结, L18~L35 通过 LoRA 协同训练 (Draft Evolver + VLM 协同)
+#   - 训练 RLD Controller + PrefixKVProjector + LoRA (~34M 参数)
+#   - 通过 PrefixKVProjector 将 draft 注入为 prefix KV (训推一致)
+#   - 在 "Step N:" (N>=2) 和 "Final Answer:" 边界触发 "回看-验证" 更新
+#   - 使用 Qwen3-VL-Instruct 原生格式 (Step N: + Final Answer:), 消除训推格式不一致
+#   - Stage 1 不使用对比学习 loss, 依靠 CE + Grounding + Diversity + Commit loss 训练
 
 # 基座模型配置
 model:
@@ -30,40 +32,49 @@ rld:
   
   # 正则化
   lambda_div: 0.1            # 多样性正则化权重 (配合 threshold=0.3 的余弦惩罚, 只惩罚 cosim>0.3 的部分)
+  max_scale: 0.3             # Scale 上界 (prefix KV 方案中主要用于 PrefixKVProjector 的范数约束)
+  selective_injection: true   # 选择性注入 (保留用于未来扩展)
   
-  # ====== 防止 Draft 替代基座推理的四重防线 ======
-  #
-  # 1. KL 散度正则化: 惩罚 adapted logits 偏离基座 logits 的程度
-  #    让 draft 只做 "微调" 而非 "重写"
-  #    建议范围: 0.05~0.3 (KL 量级通常比 CE 大, 不宜设太高)
-  lambda_kl: 0.1
+  # ====== 简化模式: 去掉 TraceUpdater 的累计轨迹压缩 ======
+  # 设为 false 时: 直接用 S_c (当前 step 摘要) 作为 ReflectionModule 的 query
+  # Z_d 通过残差步进自然累积历史信息, 不需要 T_c 再重复编码
+  # 优势: 更短的梯度路径 (4层CA vs 7层CA), 更精准的检索 query, 节省 ~3.5M 参数
+  # 设为 true 时: 保持传统的 TraceUpdater 累计轨迹模式 (兼容旧 checkpoint)
+  use_trace_updater: false
   
-  # 2. Scale 上界 + L2 软约束:
-  #    - 硬上界 (clamp): 防止极端情况, 但主要靠 L2 正则化
-  #    - L2 正则化 (lambda=0.1): 温和拉回 scale, 梯度始终存在 (不像 clamp 梯度断裂)
-  #    建议范围: 0.3~0.5
-  max_scale: 0.3
+  # ====== 双向检索-验证模式 ======
+  # 设为 true 时: 去掉 EvidenceResampler 的 16 slots 压缩, 直接用 visual_hidden_proj (~500 tokens)
+  # 方向1: CA(Q=S_c, KV=visual_hidden_proj) → R_c (推理→图像, 精准检索)
+  # 方向2: CA(Q=R_c, KV=S_c) → G_c (图像→推理, 反向验证)
+  # 优势: 检索精度 ×30 (375K vs 12K 标量), 纠错信号更强, 参数量净增仅 ~1M
+  # 设为 false 时: 保持旧的 EvidenceResampler + 单向 ReflectionModule (兼容旧 checkpoint)
+  use_bidirectional_reflection: true
   
-  # 3. 修正量范数比约束 (adapter 内部):
-  #    限制 ||delta|| / ||h|| ≤ max_adapt_ratio (默认 15%)
-  #    即使 scale 和 adapter 权重都很大, 修正量也不会超过原始 hidden 的 15%
-  #    这是比 scale clamp 更本质的约束
-  
-  # 4. 源头选择性注入: 在 Pass 2 的 adapter 注入层直接做 token 级加权
-  #    基座越确定的 token → 注入权重越小 (最低 0.05) → KV 中几乎不含 draft 信息
-  #    基座越不确定的 token → 注入权重越大 (最高 1.0) → draft 在关键位置发力
-  #    相比旧版"事后衰减", 源头控制确保 KV cache 也不被不必要地修改
-  selective_injection: true
+  # ====== LoRA 协同训练配置 ======
+  # Stage 1 即启用 LoRA, 让基座中高层 (L18~L35) 适配 prefix KV 的注入模式
+  # LoRA 让注入层的 Q/K/V/O 投影学会更好地"查询"和"协调" prefix KV
+  # 参数量较小 (~9M), 不会显著增加显存
+  lora:
+    enabled: true              # 是否启用 LoRA
+    r: 16                      # LoRA 秩
+    alpha: 32                  # LoRA 缩放因子 (alpha/r = 2, 标准缩放)
+    dropout: 0.05              # LoRA dropout
+    target_modules:            # 目标模块 (注入层的 attention 投影, 含 k_proj 以适配 prefix KV 注入)
+      - q_proj
+      - k_proj
+      - v_proj
+    layers: null               # 应用层范围 (null = 默认 L18~L35, 即注入层范围内的所有层)
 
 # 数据配置
 data:
   # 训练数据: JSON 格式
-  # 每个样本: {"image": path, "question": text, "answer": text}
-  # answer 中可以包含 </step> 作为步骤分隔符
-  train_json: "/mnt/cephszjt/user_juntianzhang/LatentDraft/data/rld_50k_selected.json"
+  # Stage 1 使用纯 correct_cot (dataset_converted) 数据, 50K 条
+  # 全部 think + answer 参与 CE loss, 提供密集一致的监督信号
+  # 每个样本: {"image": path, "question": text, "answer": text, "think_chain": text, ...}
+  train_json: "/mnt/cephszjt/user_juntianzhang/LatentDraft/data/rld_50k_newformat.json"
   # eval_json: "/path/to/your/rld_val.json"   # 可选，暂未配置
   
-  # 自动分步: 对于无 </step> 标注的数据，按句号/换行自动分段
+  # 自动分步: 对于无预生成推理链的数据，按句号/换行自动分段为 "Step N:" 格式
   auto_split_steps: true
   
   # 跳过图片存在性检查: 数据已通过 scripts/prefilter_data.py 预过滤时设为 true
@@ -85,14 +96,21 @@ data:
   # 如果遇到 cudaErrorContained (NVLink 显存越界), 降低此值到 2048 或 1536。
   max_seq_len: 2048
   
+  # P0: 困难样本下采样比例上限
+  # pass_rate=0 的样本 (基座 4 次采样全错) 占比过高会导致 draft 学坏,
+  # 将其下采样到不超过总数据的此比例。设为 1.0 则不下采样。
+  # Stage 1 使用纯 correct_cot 数据, 无需下采样
+  hard_sample_max_ratio: 1.0
+  
   # System Prompt: 在对话中注入分步推理指令
-  # 训练和推理时统一使用，引导模型自主按 </step> 分步输出思维链
+  # 训练和推理时统一使用，引导模型自主按 "Step N:" + "Final Answer:" 格式输出
+  # 与 rejection sampling 使用完全相同的 prompt, 确保训推格式一致
   use_system_prompt: true
   # system_prompt: null  # 使用默认 RLD_SYSTEM_PROMPT; 也可自定义字符串
 
 # 训练配置
 training:
-  output_dir: "./outputs/rld_top8_rerun_768"
+  output_dir: "./outputs/rld_kv_prefix_768_bidirection_stage1"
   
   # 训练参数
   num_epochs: 1
@@ -102,7 +120,8 @@ training:
   
   # 学习率
   learning_rate: 1.0e-4              # 全局学习率 (TrainingArguments 需要)
-  controller_lr: 1.0e-4              # RLD Controller 学习率
+  controller_lr: 1.0e-4              # RLD Controller + PrefixKVProjector 学习率
+  lora_lr: 3.0e-5                    # LoRA 学习率 (比 Controller 小 3×, 防止破坏基座能力)
   weight_decay: 0.01
   warmup_steps: 100
   max_grad_norm: 1.0

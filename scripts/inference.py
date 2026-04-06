@@ -132,9 +132,9 @@ class RLDInference:
         text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        # 注意: 不在此处追加 "<think>\n"!
-        # model.py 的 generate() 方法会在 prefill 后自动 feed "<think>\n" token，
-        # 确保训推一致性由 model 层统一保证，调用方无需关心。
+        # 注意: 新格式下不需要追加任何前缀!
+        # model.py 的 generate() 方法直接从 generation prompt 后开始自回归生成,
+        # 模型会自主输出 "Step 1: ..." 格式 (由 system prompt 引导)。
         if process_vision_info:
             image_inputs, _ = process_vision_info(messages)
         else:
@@ -165,19 +165,27 @@ class RLDInference:
             generated_tokens, skip_special_tokens=False
         )
 
-        # 后处理: 用 </think> 分割 CoT 和 final answer
-        # generated_ids 包含: [prompt | <think>\n | 生成内容]
-        # 生成内容的格式应为: "{think_steps}</think>\n\n{final_answer}<|im_end|>"
-        # 因此 full_output 解码后包含: "<think>\n{think_steps}</think>\n\n{final_answer}<|im_end|>"
-        if "</think>" in full_output:
+        # 后处理: 用 "Final Answer:" 分割 CoT 和 final answer
+        # generated_ids 包含: [prompt | 生成内容]
+        # 生成内容的格式应为: "Step 1: ...\nStep 2: ...\nFinal Answer: {answer}<|im_end|>"
+        if "Final Answer:" in full_output:
+            # 找到最后一个 "Final Answer:" (鲁棒处理多次出现的情况)
+            fa_idx = full_output.rfind("Final Answer:")
+            cot_part = full_output[:fa_idx].strip()
+            answer_part = full_output[fa_idx + len("Final Answer:"):].strip()
+            # 清理 answer 中的特殊标记
+            answer = answer_part.replace("<|im_end|>", "").strip()
+            # 清理 CoT 中的特殊标记 (兼容旧格式残留)
+            cot = cot_part.replace("</step>", " ").replace("<think>", "").replace("</think>", "").strip()
+        elif "</think>" in full_output:
+            # 兼容旧格式: 如果模型仍然输出 </think>
             think_part, answer_part = full_output.split("</think>", 1)
-            # CoT 部分: 清理 </step> 标记
-            cot = think_part.replace("</step>", " ").strip()
-            # Answer 部分: 清理特殊标记
+            cot = think_part.replace("</step>", " ").replace("<think>", "").strip()
             answer = answer_part.replace("<|im_end|>", "").strip()
         else:
-            # 异常情况: 模型未输出 </think>，整体视为 answer
-            answer = full_output.replace("<|im_end|>", "").replace("</step>", "").replace("<think>", "").strip()
+            # 异常情况: 模型未输出 "Final Answer:" 也未输出 "</think>"
+            # 尝试从末尾提取答案
+            answer = full_output.replace("<|im_end|>", "").replace("</step>", "").replace("<think>", "").replace("</think>", "").strip()
             cot = None
 
         return answer

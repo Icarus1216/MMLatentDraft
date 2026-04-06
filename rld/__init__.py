@@ -13,13 +13,17 @@ from .modules import (
     CrossAttentionBlock,
     EvidenceResampler,
     StepResampler,
+    StreamingTraceAccumulator,
+    CommitGate,
     TraceUpdater,
+    TraceEMA,
     ReflectionModule,
+    BidirectionalReflection,
     DraftUpdater,
     ResidualFlowDraftUpdater,
-    DraftReadoutAdapter,
-    MultiLayerDraftReadout,
-    InSituDraftInjector,
+    CurrentDominantDraftRefiner,
+    LatentDraftFlow,
+    PrefixKVProjector,
 )
 from .controller import RLDController
 from .model import RLDModel

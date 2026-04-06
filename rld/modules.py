@@ -218,6 +218,10 @@ class StepResampler(nn.Module):
     将当前 step 的 hidden states H^{step}_c ∈ R^{L_c × 2048}
     压缩为固定长度摘要 S_c ∈ R^{K_t × d_z}
     
+    输出经过 RMSNorm 归一化, 防止 CA 残差连接导致范数爆炸。
+    (训练 400 步后 S_c 范数从 ~27 爆炸到 ~35000, 根因是 CA 内部
+     query + attn_output + FFN 的残差叠加。加 RMSNorm 后范数稳定在 ~sqrt(d_z)≈27)
+    
     Args:
         hidden_size: 基座模型隐藏维度 (4096)
         d_z: controller 空间维度 (512)
@@ -239,11 +243,20 @@ d_z: int = 768,
         # 从 hidden_size 投影到 d_z
         self.proj_h = nn.Linear(hidden_size, d_z, bias=False)
 
-        # 可学习的 step queries
-        self.step_queries = nn.Parameter(torch.randn(1, num_trace_slots, d_z) * 0.02)
+        # 可学习的 step queries (正交初始化, 确保 16 个 query 方向完全分化)
+        # 旧版 randn*0.02 范数太小 (~0.55), softmax 无法区分方向 → S_c 有效秩 ~1.4
+        # 正交初始化: 每行范数 ≈ 1.0, 行间严格正交 → 初始有效秩 ≈ num_trace_slots
+        _step_queries_data = torch.empty(num_trace_slots, d_z)
+        nn.init.orthogonal_(_step_queries_data)
+        self.step_queries = nn.Parameter(_step_queries_data.unsqueeze(0))  # [1, K_t, d_z]
 
         # 单层 cross-attention (step 摘要不需要太深)
         self.ca_block = CrossAttentionBlock(d_model=d_z, num_heads=num_heads)
+
+        # 输出归一化: 防止 CA 残差连接导致 S_c 范数爆炸
+        # CA 内部: output = query + attn(query, kv) + FFN(...)  → 范数随训练不断增长
+        # 加 RMSNorm 后: S_c 范数稳定在 ~sqrt(d_z) ≈ 27, 不会随训练爆炸
+        self.output_norm = RMSNorm(d_z)
 
     def forward(self, step_hidden_states: torch.Tensor) -> torch.Tensor:
         """
@@ -251,7 +264,7 @@ d_z: int = 768,
             step_hidden_states: [B, L_c, hidden_size] 当前 step 的最后层 hidden states
         
         Returns:
-            S_c: [B, K_t, d_z] 当前 step 的摘要
+            S_c: [B, K_t, d_z] 当前 step 的摘要 (已归一化, 范数 ~sqrt(d_z))
         """
         B = step_hidden_states.shape[0]
 
@@ -267,22 +280,276 @@ d_z: int = 768,
         # Cross-attention
         S_c = self.ca_block(query=queries, key_value=h_hat)
 
+        # 输出归一化: 防止范数爆炸
+        S_c = self.output_norm(S_c)
+
         return S_c  # [B, K_t, d_z]
+
+
+class StreamingTraceAccumulator(nn.Module):
+    """
+    流式轨迹累积器: 每 token 增量更新 running summary S_running
+    
+    用 GRU Cell 替代 StepResampler 的 batch Cross-Attention:
+    1. 每次只处理 1 个 token，CA 的 KV 只有 1 行，退化为线性变换
+    2. GRU 天然支持流式输入，无需缓存历史 hidden
+    3. 参数量极小：3 * d_z * d_z ≈ 1.8M (d_z=768)
+    
+    设计:
+    - 每个 slot 独立的 GRU cell (共享参数)
+    - 输入: 当前 token 的 hidden state h_t (投影到 d_z)
+    - 输出: 更新后的 running summary S_running
+    
+    只在句末 (句号/换行/冒号等标点) 计算 CommitGate 分数,
+    保持句内连贯性, 避免句中 commit 打断推理流。
+    
+    Args:
+        hidden_size: 基座模型隐藏维度 (4096 for Qwen3-VL-8B)
+        d_z: controller 空间维度 (768)
+        num_trace_slots: 轨迹槽数量 K_t (默认 16)
+    """
+
+    def __init__(
+        self,
+        hidden_size: int = 4096,
+        d_z: int = 768,
+        num_trace_slots: int = 16,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.d_z = d_z
+        self.num_slots = num_trace_slots
+
+        # 从 hidden_size 投影到 d_z (与 StepResampler 共享投影维度)
+        self.proj_h = nn.Linear(hidden_size, d_z, bias=False)
+
+        # GRU Cell: 所有 slot 共享参数, 每个 slot 独立更新
+        # GRU 参数量: 3 * (d_z * d_z + d_z * d_z) = 6 * d_z^2 ≈ 3.5M
+        self.gru = nn.GRUCell(d_z, d_z)
+
+        # 初始化: 小范围初始化 GRU 权重, 确保初始 S_running 变化平缓
+        self._init_weights()
+
+    def _init_weights(self):
+        """小范围初始化, 确保初始 GRU 输出接近输入 (近似恒等映射)"""
+        for name, param in self.gru.named_parameters():
+            if 'weight' in name:
+                nn.init.orthogonal_(param, gain=0.5)
+            elif 'bias' in name:
+                nn.init.zeros_(param)
+
+    def forward(
+        self,
+        h_t: torch.Tensor,          # [B, 1, hidden_size] 当前 token 的 hidden state
+        S_running: torch.Tensor,     # [B, K_t, d_z] 当前的 running summary
+    ) -> torch.Tensor:
+        """
+        单 token 增量更新 S_running
+        
+        Args:
+            h_t: [B, 1, hidden_size] 当前 token 的 hidden state
+            S_running: [B, K_t, d_z] 当前的 running summary
+        
+        Returns:
+            S_running_new: [B, K_t, d_z] 更新后的 running summary
+        """
+        B, K, D = S_running.shape
+        param_dtype = self.proj_h.weight.dtype
+        h_t = h_t.to(param_dtype)
+        S_running = S_running.to(param_dtype)
+
+        # 投影到 d_z 空间
+        h_proj = self.proj_h(h_t.squeeze(1))  # [B, d_z]
+
+        # 广播到所有 slot: 每个 slot 接收相同的输入, 但有不同的隐状态
+        h_expand = h_proj.unsqueeze(1).expand(B, K, D)  # [B, K, d_z]
+
+        # GRU: 每个 slot 独立更新 (共享 GRU 参数)
+        S_flat = S_running.reshape(B * K, D)      # [B*K, d_z]
+        h_flat = h_expand.reshape(B * K, D)        # [B*K, d_z]
+        S_new_flat = self.gru(h_flat, S_flat)      # [B*K, d_z]
+        S_running_new = S_new_flat.reshape(B, K, D)
+
+        return S_running_new
+
+    def forward_batch(
+        self,
+        hidden_states: torch.Tensor,   # [B, L, hidden_size] 多 token 的 hidden states
+        S_running: torch.Tensor,        # [B, K_t, d_z] 初始 running summary
+    ) -> torch.Tensor:
+        """
+        批量处理多个 token (训练时使用, 沿序列维度逐 token 展开 GRU)
+        
+        Args:
+            hidden_states: [B, L, hidden_size] 一段 token 的 hidden states
+            S_running: [B, K_t, d_z] 初始 running summary
+        
+        Returns:
+            S_running_final: [B, K_t, d_z] 处理完所有 token 后的 running summary
+        """
+        B, L, H = hidden_states.shape
+        K, D = S_running.shape[1], S_running.shape[2]
+        param_dtype = self.proj_h.weight.dtype
+        hidden_states = hidden_states.to(param_dtype)
+        S_running = S_running.to(param_dtype)
+
+        # 投影所有 token 到 d_z 空间
+        h_proj = self.proj_h(hidden_states)  # [B, L, d_z]
+
+        # 沿序列维度逐 token 展开 GRU
+        S_current = S_running
+        for t in range(L):
+            h_t = h_proj[:, t, :]  # [B, d_z]
+            h_expand = h_t.unsqueeze(1).expand(B, K, D)  # [B, K, d_z]
+            S_flat = S_current.reshape(B * K, D)
+            h_flat = h_expand.reshape(B * K, D)
+            S_new_flat = self.gru(h_flat, S_flat)
+            S_current = S_new_flat.reshape(B, K, D)
+
+        return S_current
+
+
+class CommitGate(nn.Module):
+    """
+    学习型 Commit 门控: 决定何时将 S_running commit 到完整的 draft 更新链路
+    
+    灵感来自 Adaptive Computation Time (ACT) 的 halting score:
+    - 不累积 halting probability, 而是直接输出 commit_score ∈ (0,1)
+    - commit_score > τ 时触发 commit
+    - τ 是可调超参 (训练时用 teacher-forced boundary 做监督)
+    
+    只在句末计算 commit_score, 保持句内连贯性:
+    - 句末标记: 句号(。.)、换行(\\n)、冒号(:)、分号(;) 等
+    - 句内 token 不计算 commit_score, 直接跳过
+    - 这避免了句中 commit 打断推理流的问题
+    
+    输入信号 (3 个 d_z 维向量拼接):
+    1. S_running 的变化率 (delta_S): 信息饱和度指标
+    2. S_running 与 Z_d 的差异 (staleness): draft 是否过时
+    3. S_running 自身的信息量 (S_info): 当前累积的信息量
+    
+    Args:
+        d_z: controller 空间维度 (768)
+        commit_threshold: commit 阈值 τ (默认 0.5)
+        min_tokens_between_commits: 两次 commit 之间的最小 token 数 (默认 8)
+        max_tokens_between_commits: 两次 commit 之间的最大 token 数 (默认 128)
+    """
+
+    def __init__(
+        self,
+        d_z: int = 768,
+        commit_threshold: float = 0.5,
+        min_tokens_between_commits: int = 8,
+        max_tokens_between_commits: int = 128,
+    ):
+        super().__init__()
+        self.d_z = d_z
+        self.commit_threshold = commit_threshold
+        self.min_tokens = min_tokens_between_commits
+        self.max_tokens = max_tokens_between_commits
+
+        # Commit score 预测头: 3*d_z → d_z → 1
+        self.score_head = nn.Sequential(
+            RMSNorm(d_z * 3),
+            nn.Linear(d_z * 3, d_z, bias=False),
+            nn.SiLU(),
+            nn.Linear(d_z, 1, bias=True),
+        )
+        # 初始 bias 偏低 (-2.0), 训练初期倾向于不 commit (保守策略)
+        # sigmoid(-2.0) ≈ 0.12, 远低于默认阈值 0.5
+        nn.init.constant_(self.score_head[-1].bias, -2.0)
+        # 小范围初始化权重, 确保初始输出稳定
+        nn.init.normal_(self.score_head[1].weight, std=0.02)
+        nn.init.normal_(self.score_head[-1].weight, std=0.02)
+
+    def forward(
+        self,
+        S_running: torch.Tensor,    # [B, K_t, d_z] 当前 running summary
+        S_prev: torch.Tensor,       # [B, K_t, d_z] 上次 commit 时的 S_running
+        Z_d: torch.Tensor,          # [B, K_d, d_z] 当前 draft state
+    ) -> torch.Tensor:
+        """
+        计算 commit score
+        
+        Args:
+            S_running: [B, K_t, d_z] 当前 running summary
+            S_prev: [B, K_t, d_z] 上次 commit 时的 S_running (用于计算变化率)
+            Z_d: [B, K_d, d_z] 当前 draft state (用于计算 staleness)
+        
+        Returns:
+            commit_score: [B, 1] ∈ (0, 1), 越高越应该 commit
+        """
+        param_dtype = self.score_head[1].weight.dtype
+        S_running = S_running.to(param_dtype)
+        S_prev = S_prev.to(param_dtype)
+        Z_d = Z_d.to(param_dtype)
+
+        # 信号 1: S_running 的变化率 (信息饱和度)
+        # 变化大 → 新信息多 → 可能需要 commit
+        delta_S = (S_running - S_prev).mean(dim=1)  # [B, d_z]
+
+        # 信号 2: S_running 与 Z_d 的差异 (draft 过时程度)
+        # 差异大 → draft 过时 → 需要 commit 更新
+        staleness = (S_running.mean(dim=1) - Z_d.mean(dim=1))  # [B, d_z]
+
+        # 信号 3: S_running 自身的信息量
+        S_info = S_running.mean(dim=1)  # [B, d_z]
+
+        # 拼接 3 个信号
+        combined = torch.cat([delta_S, staleness, S_info], dim=-1)  # [B, 3*d_z]
+
+        # 预测 commit score
+        commit_score = torch.sigmoid(self.score_head(combined))  # [B, 1]
+
+        return commit_score
+
+    def should_commit(
+        self,
+        commit_score: torch.Tensor,    # [B, 1]
+        token_count: int,               # 自上次 commit 以来的 token 数
+        is_sentence_end: torch.Tensor,  # [B] bool, 当前 token 是否为句末标记
+    ) -> torch.Tensor:
+        """
+        综合判断是否应该 commit (推理时使用)
+        
+        触发条件 (满足任一):
+        1. 句末 + commit_score > τ + token_count >= min_tokens
+        2. token_count >= max_tokens (硬上限, 防止永不 commit)
+        
+        Args:
+            commit_score: [B, 1] commit 分数
+            token_count: 自上次 commit 以来的 token 数
+            is_sentence_end: [B] bool, 当前 token 是否为句末标记
+        
+        Returns:
+            should_commit: [B] bool, 是否应该 commit
+        """
+        B = commit_score.shape[0]
+        device = commit_score.device
+
+        # 条件 1: 句末 + 分数超阈值 + 最小间隔
+        gate_trigger = (
+            is_sentence_end
+            & (commit_score.squeeze(-1) > self.commit_threshold)
+            & (token_count >= self.min_tokens)
+        )
+
+        # 条件 2: 硬上限
+        hard_trigger = torch.full((B,), token_count >= self.max_tokens,
+                                  dtype=torch.bool, device=device)
+
+        return gate_trigger | hard_trigger
 
 
 class TraceUpdater(nn.Module):
     """
-    累计式推理轨迹更新器 (2 层 CA)
+    [已弃用] 累计式推理轨迹更新器 (2 层 CA)
     
-    将 "旧记忆 T_{c-1} + 新摘要 S_c" 重新压回固定长度 T_c:
-      T_c = Resample_t([T_{c-1}; S_c])
+    保留用于加载旧 checkpoint, forward 中不再使用。
+    新代码请使用 TraceEMA。
     
-    这与 Compressive Transformer 的思想一致：
-    把历史信息不断压缩进固定容量的记忆中。
-    
-    使用 2 层 cross-attention：
-    - 第 1 层：粗选（确定 T_prev 中哪些历史信息值得保留）
-    - 第 2 层：精融（将选中的历史和新摘要融合到 K_t 个 slot 中）
+    问题: 2 层 CA 从 [T_prev; S_c] (32 tokens) 中重采样到 16 slots,
+    这是一个 16→16 的方阵映射, 天然倾向秩坍塌 (T_rank=1.0)。
     
     Args:
         d_z: controller 空间维度
@@ -333,9 +600,62 @@ d_z: int = 768,
         return queries  # [B, K_t, d_z]
 
 
+class TraceEMA(nn.Module):
+    """
+    EMA 轨迹更新器: 用 per-slot 可学习 α 做指数移动平均
+    
+    核心公式:
+      T_c = α_i · T_{c-1} + (1 - α_i) · S_c
+    
+    其中 α_i ∈ (0, 1) 是 per-slot 可学习的记忆保留率:
+    - α_i 大 → 保留更多历史 (长期记忆)
+    - α_i 小 → 更多采纳当前 S_c (短期响应)
+    - 每个 slot 独立学习自己的 α_i → 不同 slot 可以有不同的时间尺度
+    
+    设计动机 (替代 TraceUpdater 的 2 层 CA):
+    - TraceUpdater 的 2 层 CA 从 [T_prev; S_c] (32 tokens) 重采样到 16 slots
+      → 16→16 的方阵映射天然倾向秩坍塌 (T_rank=1.0)
+    - EMA 是逐 slot 独立更新, 天然保持 slot 独立性:
+      每个 slot 的更新只依赖自己的 T_prev[i] 和 S_c[i], 不会被其他 slot 污染
+    - 参数量极小: 只有 16 个可学习的 α_i (vs TraceUpdater 的 ~2.4M)
+    - 无超参数, 训练稳定
+    
+    初始化策略:
+    - α_logit 初始化为 1.0 → sigmoid(1.0) ≈ 0.73
+    - 训练初期偏向保留历史 (α≈0.73), 随训练自动调节
+    - 这比 α=0.5 (等权) 更合理: 历史轨迹是多步累积的, 应该有更高的惯性
+    
+    Args:
+        num_trace_slots: 轨迹槽数量 K_t (默认 16)
+    """
+
+    def __init__(self, num_trace_slots: int = 16):
+        super().__init__()
+        self.num_slots = num_trace_slots
+
+        # per-slot 可学习的记忆保留率 α_i
+        # sigmoid(1.0) ≈ 0.73: 训练初期偏向保留历史
+        self.alpha_logit = nn.Parameter(torch.ones(1, num_trace_slots, 1) * 1.0)  # [1, K_t, 1]
+
+    def forward(
+        self,
+        T_prev: torch.Tensor,   # [B, K_t, d_z] 上一步的轨迹记忆
+        S_c: torch.Tensor,       # [B, K_t, d_z] 当前步的摘要
+    ) -> torch.Tensor:
+        """
+        EMA 更新: T_c = α · T_prev + (1 - α) · S_c
+        
+        Returns:
+            T_c: [B, K_t, d_z] 更新后的累计轨迹记忆
+        """
+        alpha = torch.sigmoid(self.alpha_logit)  # [1, K_t, 1], ∈ (0, 1)
+        T_c = alpha * T_prev + (1.0 - alpha) * S_c
+        return T_c  # [B, K_t, d_z]
+
+
 class ReflectionModule(nn.Module):
     """
-    回看-验证模块 (核心操作, 2 层 CA)
+    回看-验证模块 (核心操作, 2 层 CA + ConsistencyHead)
     
     用累计轨迹 T_c 作为 query，去冻结的视觉证据 Z^e 中检索:
       G_c = CA_layers(Q=T_c, K=Z^e, V=Z^e)
@@ -345,6 +665,12 @@ class ReflectionModule(nn.Module):
     - 对 Z^e 做 cross-attn 相当于:
       "用当前推理作为 query 去图像证据里找相关区域/数字/关系的 latent 支撑"
     - G_c 是 grounded trace (被视觉证据支撑/对齐后的推理表示)
+    
+    ConsistencyHead (新增):
+    - 对比 T_c (纯推理轨迹) 和 G_c (被证据校验后的推理)
+    - 差异 T_c - G_c 的语义: "推理中没有被视觉证据支撑的部分"
+    - 差异越大 → 推理越偏离证据 → consistency_score 越低
+    - consistency_score ∈ (0, 1), 用于下游 inject_weight 融合
     
     使用 2 层 cross-attention 实现 "retrieval then verification" 范式：
     - 第 1 层：初步检索相关证据（"图中有哪些与当前推理相关的数字/关系？"）
@@ -358,24 +684,273 @@ class ReflectionModule(nn.Module):
 
     def __init__(self, d_z: int = 768, num_heads: int = 8, num_layers: int = 2):
         super().__init__()
+        self.d_z = d_z
         self.layers = nn.ModuleList([
             CrossAttentionBlock(d_model=d_z, num_heads=num_heads)
             for _ in range(num_layers)
         ])
 
+        # ====== ConsistencyHead: 从 T_c - G_c 对比信号中提取一致性分数 ======
+        # 输入: T_c - G_c 的 slot 级均值 [B, d_z]
+        # 输出: consistency_score [B, 1] ∈ (0, 1)
+        # 参数量: d_z * (d_z/4) + (d_z/4) * 1 ≈ 148K (d_z=768)
+        self.consistency_head = nn.Sequential(
+            RMSNorm(d_z),
+            nn.Linear(d_z, d_z // 4, bias=False),
+            nn.SiLU(),
+            nn.Linear(d_z // 4, 1, bias=True),
+        )
+        # 初始 bias=0.85 → sigmoid(0.85) ≈ 0.70
+        # 训练初期 consistency_score ≈ 0.7 (偏高), 不影响下游 inject_weight
+        nn.init.constant_(self.consistency_head[-1].bias, 0.85)
+        # 小范围初始化权重, 确保初始输出稳定
+        nn.init.normal_(self.consistency_head[1].weight, std=0.02)
+        nn.init.normal_(self.consistency_head[-1].weight, std=0.02)
+
     def forward(
         self,
         T_c: torch.Tensor,   # [B, K_t, d_z]
         Z_e: torch.Tensor,   # [B, K_e, d_z]
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
             G_c: [B, K_t, d_z] grounded trace (证据支撑的推理表示)
+            consistency_score: [B, 1] ∈ (0, 1) 推理-证据一致性分数
+                高分 → 推理与证据一致, 低分 → 推理偏离证据
         """
         G_c = T_c
         for layer in self.layers:
             G_c = layer(query=G_c, key_value=Z_e)
-        return G_c
+
+        # ====== ConsistencyHead: 计算推理-证据一致性分数 ======
+        # 对比信号: T_c - G_c (推理中未被证据支撑的部分)
+        # G_c = T_c + Δ (CA 内部有残差连接), 所以 T_c - G_c ≈ -Δ
+        # 差异越大 → 推理越偏离证据 → consistency_score 越低
+        contrast = (T_c - G_c).mean(dim=1)  # [B, d_z] slot 级均值
+        consistency_score = torch.sigmoid(self.consistency_head(contrast))  # [B, 1]
+
+        return G_c, consistency_score
+
+
+class BidirectionalReflection(nn.Module):
+    """
+    双向检索-验证模块 v4 (二次检索验证 + 自适应纠错)
+    
+    核心思想: 去掉 16 slots 的 EvidenceResampler 压缩, 直接从原始 visual_hidden_proj
+    (~500 个 token, 768 维) 中进行检索, 然后通过二次检索验证生成纠错残差。
+    
+    方向 1 (推理→图像 检索): CA(Q=S_c, KV=visual_hidden_proj) → R_c
+        使用完整的 CrossAttentionBlock (含残差+FFN), 让 R_c = S_c + 视觉证据增量
+        R_c 保留了 S_c 的推理信息, 同时融入了从图像中检索到的证据
+    
+    方向 2 (二次检索验证): CA(Q=R_c, KV=visual_hidden_proj) → V_c
+        核心: 用融合了图像信息的 R_c 再次检索图像, 得到 V_c
+        如果 R_c 正确融合了图像信息 → V_c ≈ R_c (二次检索结果一致)
+        如果 R_c 融合了错误信息 → V_c ≠ R_c (二次检索发现不一致)
+        diff = V_c - R_c 是真正的验证信号, 而非 v3 中的 R_c - S_c (仅反映检索量)
+    
+    一致性信号: 用 V_c 和 R_c 的差异驱动
+        V_c 是二次检索结果, R_c 是一次检索结果, 差异 = 一次检索的不一致程度
+        consistency_score 同时用于:
+        1. 内部: 调制 gate_correct (纠错残差的力度)
+        2. 外部: 调制 gc_inject_gate (G_c vs Z_d_init 的融合比例)
+    
+    v3 的问题 (基于真实数据分析):
+    - diff = R_c - S_c 是第一层 CA 的增量 Δ_visual, 不区分"确认"和"矛盾"
+    - Step 2 "FE=10" 正确引用图像 → Δ_visual 大 → cs 低 → 误判为"偏离"
+    - ConsistencyHead 实际测量的是"图像中有多少相关信息", 而非"推理是否正确"
+    
+    v4 改进:
+    - 第二层改为 R_c 对 visual_hidden_proj 做二次检索 → V_c
+    - diff = V_c - R_c: 二次检索差异, 真正反映一次检索的一致性
+    - 正确引用图像时: V_c ≈ R_c → diff 小 → cs 高 → 不纠错 ✅
+    - 错误引用图像时: V_c ≠ R_c → diff 大 → cs 低 → 强纠错 ✅
+    - 参数量从 ~1.2M 增至 ~2.4M (多一个 CA), 但验证信号语义正确
+    
+    Args:
+        d_z: controller 空间维度 (768)
+        num_heads: cross-attention 头数 (8)
+    """
+
+    def __init__(self, d_z: int = 768, num_heads: int = 8):
+        super().__init__()
+        self.d_z = d_z
+        self.num_heads = num_heads
+        self.head_dim = d_z // num_heads
+
+        # 方向 1: 推理→图像 (一次检索) — 完整 CrossAttentionBlock (含残差+FFN)
+        # Q=S_c [B, 16, 768], KV=visual_hidden_proj [B, ~500, 768]
+        # R_c = S_c + attn(S_c, VH) + FFN, 保留推理信息 + 融入视觉证据
+        self.retrieval_ca = CrossAttentionBlock(d_model=d_z, num_heads=num_heads)
+
+        # ====== 层间归一化: 防止两层 CA 残差叠加导致范数爆炸 ======
+        # CrossAttentionBlock 的残差连接 (R_c = S_c + Δ1 + FFN1) 会让范数持续增长
+        # 不加归一化时, 训练 400 步后 R_c norm 从 ~27 爆炸到 ~25000
+        # 导致 ConsistencyHead 输入饱和 → cs ≈ 0 恒定 → 纠错失去自适应能力
+        # → G_c 被 output_norm 压缩后 slot 方向趋同 → Z_d 完全坍塌 (rank=1)
+        self.inter_norm = RMSNorm(d_z)
+
+        # ====== 方向 2: 二次检索验证 (Re-retrieval Verification) ======
+        # 核心思想: 用 R_c (融合了图像信息的推理状态) 再次检索图像 → V_c
+        # 如果一次检索正确: R_c 中的图像信息与原图一致 → V_c ≈ R_c → diff 小
+        # 如果一次检索错误: R_c 中的图像信息与原图矛盾 → V_c ≠ R_c → diff 大
+        # diff = V_c - R_c 是真正的验证信号
+        self.verify_ca = CrossAttentionBlock(d_model=d_z, num_heads=num_heads)
+
+        # 纠错 MLP: 将二次检索差异 (V_c - R_c) 转化为纠错残差
+        self.correction_norm = RMSNorm(d_z)
+        self.correction_mlp = nn.Sequential(
+            nn.Linear(d_z, d_z * 2, bias=False),  # 差异 → 高维空间
+            nn.SiLU(),
+            nn.Linear(d_z * 2, d_z, bias=False),  # 高维 → 纠错残差
+        )
+        # 初始化: 让纠错残差初始时接近零, 避免训练初期干扰
+        nn.init.normal_(self.correction_mlp[0].weight, std=0.02)
+        nn.init.normal_(self.correction_mlp[2].weight, std=0.01)  # 输出层更小的初始化
+
+        # 纠错力度的基础门控 (与 consistency_score 联合决定最终力度)
+        # sigmoid(0.0) = 0.5, 初始时纠错力度适中
+        self.correction_gate_logit = nn.Parameter(torch.tensor(0.0))
+
+        # [兼容旧 checkpoint] 保留 mix_gate 参数, 但不再用于 forward
+        self.mix_gate = nn.Parameter(torch.tensor(0.85))
+
+        # 输出归一化: 防止范数爆炸
+        self.output_norm = RMSNorm(d_z)
+
+        # ConsistencyHead: 从 V_c 和 R_c 的差异中提取一致性分数
+        # V_c 是二次检索结果, R_c 是一次检索结果
+        # 差异大 → 一次检索不一致 (推理偏离) → consistency_score 低
+        # 差异小 → 一次检索一致 (推理正确) → consistency_score 高
+        # v4: 基于 V_c - R_c (二次检索差异), 而非 v3 的 S_c - R_c (一次检索增量)
+        self.consistency_head = nn.Sequential(
+            RMSNorm(d_z),
+            nn.Linear(d_z, d_z // 4, bias=False),
+            nn.SiLU(),
+            nn.Linear(d_z // 4, 1, bias=True),
+        )
+        nn.init.constant_(self.consistency_head[-1].bias, 0.85)
+        nn.init.normal_(self.consistency_head[1].weight, std=0.02)
+        nn.init.normal_(self.consistency_head[-1].weight, std=0.02)
+
+    def _compute_correction(
+        self,
+        R_c: torch.Tensor,          # [B, K_t, d_z] 一次检索结果 (含视觉证据)
+        V_c: torch.Tensor,          # [B, K_t, d_z] 二次检索结果 (验证信号)
+        consistency_score: torch.Tensor,  # [B, 1] 一致性分数
+    ) -> torch.Tensor:
+        """
+        二次检索验证: 从 V_c 和 R_c 的差异中生成纠错残差
+        
+        核心逻辑:
+        1. diff = V_c - R_c: 二次检索差异 (真正的验证信号)
+           - diff 大 → 一次检索不一致 (推理偏离) → 需要强纠错
+           - diff 小 → 一次检索一致 (推理正确) → 几乎不纠错
+        2. Δ_correct = MLP(diff): 将差异转化为纠错残差
+        3. gate_correct = base_gate * (1 - cs): 自适应纠错力度
+           - cs 低 (检索不一致) → gate_correct 大 → 强纠错
+           - cs 高 (检索一致) → gate_correct 小 → 弱纠错
+        
+        Returns:
+            correction: [B, K_t, d_z] 纠错后的结果 (R_c + gate_correct * Δ_correct)
+        """
+        param_dtype = self.correction_mlp[0].weight.dtype
+        R_c = R_c.to(param_dtype)
+        V_c = V_c.to(param_dtype)
+
+        # 差异向量: 二次检索与一次检索的不一致程度
+        # V_c ≈ R_c 时 diff 小 (一次检索正确, 二次确认)
+        # V_c ≠ R_c 时 diff 大 (一次检索有误, 二次发现矛盾)
+        diff = V_c - R_c  # [B, K_t, d_z]
+        diff_normed = self.correction_norm(diff)  # 归一化, 防止差异过大时梯度爆炸
+
+        # MLP 将差异转化为纠错残差
+        delta_correct = self.correction_mlp(diff_normed)  # [B, K_t, d_z]
+
+        # 自适应纠错力度: base_gate * (1 - consistency_score)
+        # cs 低 → 检索不一致 → 纠错力度大
+        # cs 高 → 检索一致 → 纠错力度小 (保持 R_c 不变)
+        base_gate = torch.sigmoid(self.correction_gate_logit)  # 标量 ∈ (0, 1)
+        # consistency_score: [B, 1] → [B, 1, 1] 用于广播
+        adaptive_gate = base_gate * (1.0 - consistency_score.unsqueeze(-1))  # [B, 1, 1]
+
+        # 纠错: R_c + 自适应力度 * 纠错残差
+        corrected = R_c + adaptive_gate * delta_correct  # [B, K_t, d_z]
+
+        # 修正诊断信息 (detach, 不影响梯度)
+        correction_diag = {
+            'diff_norm': diff.detach().norm(dim=-1).mean().item(),           # V_c - R_c 差异范数 (越大=检索越不一致)
+            'delta_norm': delta_correct.detach().norm(dim=-1).mean().item(), # MLP 输出的纠错残差范数
+            'adaptive_gate': adaptive_gate.detach().mean().item(),           # 实际纠错力度 = base_gate * (1-cs)
+            'base_gate': base_gate.item(),                                   # 可学习的基础门控
+        }
+        return corrected, correction_diag
+
+    def forward(
+        self,
+        S_c: torch.Tensor,         # [B, K_t, d_z] 当前推理状态 (step 摘要或轨迹)
+        visual_kv: torch.Tensor,    # [B, L_v, d_z] 投影后的完整视觉 hidden
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        双向检索-验证 v4 (二次检索验证 + 自适应纠错)
+        
+        信号流:
+        1. R_c = CA(S_c, VH): 一次检索, 从图像中检索与推理相关的证据
+        2. V_c = CA(R_c, VH): 二次检索, 用融合了图像信息的 R_c 再次检索图像
+        3. consistency_score = ConsistencyHead(V_c - R_c): 检测二次检索一致性
+           - V_c ≈ R_c → 一次检索正确 → cs 高
+           - V_c ≠ R_c → 一次检索有误 → cs 低
+        4. Δ_correct = MLP(V_c - R_c): 从二次检索差异中提取纠错残差
+        5. G_c = RMSNorm(R_c + adaptive_gate * Δ_correct)
+           其中 adaptive_gate = base_gate * (1 - consistency_score)
+        
+        Args:
+            S_c: [B, K_t, d_z] 当前推理状态
+            visual_kv: [B, L_v, d_z] 投影后的完整视觉 hidden (~500 tokens)
+        
+        Returns:
+            G_c: [B, K_t, d_z] 二次检索验证后的 grounded trace (归一化后)
+            consistency_score: [B, 1] ∈ (0, 1) 二次检索一致性分数
+        """
+        # 方向 1: 一次检索 — 推理→图像 (从 ~500 个原始 token 中精准检索)
+        # R_c = S_c + attn(S_c, VH) + FFN, 保留推理信息 + 融入视觉证据
+        R_c = self.retrieval_ca(query=S_c, key_value=visual_kv)  # [B, K_t, d_z]
+
+        # 层间归一化: 防止两层 CA 残差叠加导致范数爆炸
+        # R_c 经过 RMSNorm 后范数稳定在 ~sqrt(d_z) ≈ 27, 不会随训练增长
+        R_c_normed = self.inter_norm(R_c)  # [B, K_t, d_z]
+
+        # 方向 2: 二次检索验证 — 用归一化后的 R_c 再次检索图像
+        # R_c_normed 已融合了图像证据且范数稳定, 用它再查图像:
+        # - 如果一次检索正确 (如 "FE=10" 与图像一致): R_c 中的信息与图像吻合
+        #   → 二次检索得到相似结果 → V_c ≈ R_c_normed → diff 小
+        # - 如果一次检索有误 (如 "FE=8" 但图像标注 10): R_c 中有矛盾信息
+        #   → 二次检索发现不一致 → V_c ≠ R_c_normed → diff 大
+        V_c = self.verify_ca(query=R_c_normed, key_value=visual_kv)  # [B, K_t, d_z]
+
+        # ConsistencyHead: 用 V_c 和 R_c_normed 的差异驱动
+        # V_c - R_c_normed 是二次检索的增量, 反映一次检索结果的可靠性
+        # 差异大 → 一次检索不可靠 → consistency_score 低 → 纠错信号强
+        # 差异小 → 一次检索可靠 → consistency_score 高 → 保持不变
+        # 注意: ConsistencyHead 内部第一层就是 RMSNorm, 所以 contrast 的范数已被控制
+        contrast = (V_c - R_c_normed).mean(dim=1)  # [B, d_z]
+        consistency_score = torch.sigmoid(self.consistency_head(contrast))  # [B, 1]
+
+        # 纠错: 用二次检索差异生成纠错残差, consistency_score 调制纠错力度
+        # cs 低 → 检索不一致 → 强纠错; cs 高 → 检索一致 → 弱纠错
+        # 注意: 使用归一化后的 R_c_normed 和 V_c, 确保 _compute_correction 中的
+        # diff = V_c - R_c_normed 范数稳定, 不会因范数爆炸导致 MLP 输出失控
+        G_c_raw, correction_diag = self._compute_correction(R_c_normed, V_c, consistency_score)  # [B, K_t, d_z]
+
+        # 输出归一化: 防止范数爆炸
+        G_c = self.output_norm(G_c_raw)
+
+        # 补充检索阶段的诊断信息
+        correction_diag['R_c_norm'] = R_c.detach().norm(dim=-1).mean().item()           # 归一化前的 R_c 范数 (可能增长)
+        correction_diag['R_c_normed_norm'] = R_c_normed.detach().norm(dim=-1).mean().item()  # 归一化后的 R_c 范数 (应稳定 ~27)
+        correction_diag['V_c_norm'] = V_c.detach().norm(dim=-1).mean().item()
+
+        return G_c, consistency_score, correction_diag
 
 
 class DraftUpdater(nn.Module):
@@ -427,7 +1002,7 @@ d_z: int = 768,
             Z_d_new = (1.0 - alpha) * Z_d + alpha * update
         else:
             Z_d_new = Z_d + update
-        max_norm = 43.0  # √(768/512) × 35 ≈ 43, 适配 d_z=768
+        max_norm = math.sqrt(self.d_z / 512) * 35  # 根据 d_z 动态计算
         slot_norms = Z_d_new.norm(dim=-1, keepdim=True).clamp(min=1e-8)
         clamped_scale = (max_norm / slot_norms).clamp(max=1.0)
         Z_d_new = Z_d_new * clamped_scale
@@ -581,7 +1156,358 @@ d_z: int = 768,
         Z_d_new = Z_d + dt * velocity
 
         # ====== 7. 软范数裁剪 (防止累积爆炸，保留 slot 间范数差异) ======
-        max_norm = 43.0  # √(768/512) × 35 ≈ 43, 适配 d_z=768
+        max_norm = math.sqrt(self.d_z / 512) * 35  # 根据 d_z 动态计算
+        slot_norms = Z_d_new.norm(dim=-1, keepdim=True).clamp(min=1e-8)  # [B, K_d, 1]
+        clamped_scale = (max_norm / slot_norms).clamp(max=1.0)
+        Z_d_new = Z_d_new * clamped_scale
+
+        return Z_d_new
+
+
+class CurrentDominantDraftRefiner(nn.Module):
+    """
+    Current-Dominant Draft Refiner: 以当前 G_c 为主体的 draft 更新器
+    
+    设计动机:
+    - 旧方案 ResidualFlowDraftUpdater: Z_d_{c+1} = Z_d_c + Δt·v(Z_d_c, G_c, T_c, t)
+      优点: per-slot CA 让 slot 分化; 缺点: 残差步进让历史 Z_d 稀释当前 G_c 的修正信号
+    - 方案 B compute_prefix_source: prefix = gate·G_c + (1-gate)·Z_d_init
+      优点: 当前 G_c 信号强; 缺点: 标量 gate 无法产生 per-slot 差异 → rank 坍塌
+    
+    本方案: 取两者之长
+    - 以 G_c 为主体 (不是 Z_d_prev + 增量), 确保当前步的纠错信号不被历史稀释
+    - 用 per-slot cross-attention 从 Z_d_prev 中选择性读取历史上下文 → slot 分化
+    - 用 Z_d_init 提供 per-slot 身份偏置, 保持 slot 间的结构差异
+    
+    核心公式:
+      history_ctx = CA(Q=G_c, KV=Z_d_prev)  # per-slot 从历史中读取不同信息
+      slot_bias = Linear(Z_d_init)           # per-slot 身份偏置
+      Z_d_new = output_norm(G_c + α · (history_ctx - G_c) + β · slot_bias)
+    
+    其中:
+    - α: 可学习标量, 初始 ~0.1, 控制历史信息注入量 (小值 → 当前 G_c 主导)
+    - β: 可学习标量, 初始 ~0.1, 控制 slot 身份偏置强度
+    - CA 内部: 每个 G_c slot 作为独立 query, 从 Z_d_prev 的 16 个 slot 中
+      检索不同的历史信息 → 不同 slot 获得不同的 history_ctx → slot 分化
+    
+    与旧方案的关键区别:
+    - 旧方案: Z_d 是主体, G_c 是增量 → 历史累积, 当前信号被稀释
+    - 本方案: G_c 是主体, Z_d_prev 是辅助 → 当前信号主导, 历史仅提供上下文
+    
+    Args:
+        d_z: controller 空间维度 (768)
+        num_heads: cross-attention 头数 (8)
+    """
+
+    def __init__(self, d_z: int = 768, num_heads: int = 8):
+        super().__init__()
+        self.d_z = d_z
+        self.num_heads = num_heads
+        self.head_dim = d_z // num_heads
+
+        # ====== Per-slot 历史上下文读取 ======
+        # Q=G_c [B, K_d, d_z], KV=Z_d_prev [B, K_d, d_z]
+        # 每个 G_c slot 独立从 Z_d_prev 中检索不同的历史信息
+        # 使用轻量 attention (无 FFN), 减少参数量
+        self.q_norm = RMSNorm(d_z)
+        self.kv_norm = RMSNorm(d_z)
+        self.q_proj = nn.Linear(d_z, d_z, bias=False)
+        self.k_proj = nn.Linear(d_z, d_z, bias=False)
+        self.v_proj = nn.Linear(d_z, d_z, bias=False)
+        self.o_proj = nn.Linear(d_z, d_z, bias=False)
+        # o_proj 小初始化: 初始时 CA 输出 ≈ 0, 不干扰 G_c
+        nn.init.normal_(self.o_proj.weight, std=0.01)
+
+        # ====== Slot 身份偏置 ======
+        # 从 Z_d_init 投影出 per-slot 偏置, 保持 slot 间的结构差异
+        # 即使 G_c 的 slot 方向趋同, slot_bias 也能提供分化信号
+        self.slot_bias_proj = nn.Sequential(
+            RMSNorm(d_z),
+            nn.Linear(d_z, d_z, bias=False),
+        )
+        # 小初始化: 初始时 slot_bias 不过度干扰
+        nn.init.normal_(self.slot_bias_proj[1].weight, std=0.02)
+
+        # ====== 可学习混合系数 ======
+        # α: 历史上下文注入量, sigmoid(-2.2) ≈ 0.1
+        self._history_alpha_logit = nn.Parameter(torch.tensor(-2.2))
+        # β: slot 身份偏置强度, sigmoid(-2.2) ≈ 0.1
+        self._slot_bias_beta_logit = nn.Parameter(torch.tensor(-2.2))
+
+        # ====== 输出归一化 ======
+        self.output_norm = RMSNorm(d_z)
+
+    def forward(
+        self,
+        G_c: torch.Tensor,          # [B, K_d, d_z] 当前 step 的 grounded trace (主体)
+        Z_d_prev: torch.Tensor,      # [B, K_d, d_z] 上一步的 draft state (历史上下文)
+        Z_d_init: torch.Tensor,      # [B, K_d, d_z] prefill 阶段的视觉基线 (slot 身份)
+        consistency_score: Optional[torch.Tensor] = None,  # [B, 1] 一致性分数 (可选)
+    ) -> torch.Tensor:
+        """
+        Current-Dominant Draft Refinement
+        
+        信号流:
+        1. history_ctx = CA(Q=G_c, KV=Z_d_prev): per-slot 从历史中读取上下文
+        2. slot_bias = Linear(Z_d_init): per-slot 身份偏置
+        3. Z_d_new = output_norm(G_c + α·(history_ctx - G_c) + β·slot_bias)
+        
+        当 consistency_score 低 (推理偏离) 时:
+        - 减小 α (更少依赖可能有误的历史)
+        - 增大 β (更多依赖稳定的视觉基线)
+        
+        Args:
+            G_c: [B, K_d, d_z] 当前 grounded trace
+            Z_d_prev: [B, K_d, d_z] 上一步的 draft state
+            Z_d_init: [B, K_d, d_z] 视觉基线
+            consistency_score: [B, 1] 一致性分数, None 时使用固定系数
+        
+        Returns:
+            Z_d_new: [B, K_d, d_z] 更新后的 draft state
+        """
+        param_dtype = self.q_proj.weight.dtype
+        G_c = G_c.to(param_dtype)
+        Z_d_prev = Z_d_prev.to(param_dtype)
+        Z_d_init = Z_d_init.to(param_dtype)
+
+        B, K_d, D = G_c.shape
+
+        # ====== 1. Per-slot 历史上下文读取 (轻量 CA, 无 FFN) ======
+        q = self.q_norm(G_c)
+        kv = self.kv_norm(Z_d_prev)
+
+        q = self.q_proj(q).view(B, K_d, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, K_d, D_h]
+        k = self.k_proj(kv).view(B, K_d, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(kv).view(B, K_d, self.num_heads, self.head_dim).transpose(1, 2)
+
+        scale = math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / scale
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn_output = torch.matmul(attn_weights, v)
+
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, K_d, D)
+        history_delta = self.o_proj(attn_output)  # [B, K_d, d_z], per-slot 历史增量
+
+        # ====== 2. Slot 身份偏置 ======
+        slot_bias = self.slot_bias_proj(Z_d_init)  # [B, K_d, d_z]
+
+        # ====== 3. 可学习混合系数 ======
+        alpha = torch.sigmoid(self._history_alpha_logit)  # 标量 ∈ (0, 1), 初始 ~0.1
+        beta = torch.sigmoid(self._slot_bias_beta_logit)   # 标量 ∈ (0, 1), 初始 ~0.1
+
+        # ====== 4. Consistency-aware 调制 (可选) ======
+        if consistency_score is not None:
+            # cs 低 (推理偏离) → 减小 α (历史可能有误), 增大 β (依赖稳定基线)
+            cs = consistency_score.detach().unsqueeze(-1)  # [B, 1, 1]
+            alpha_effective = alpha * cs.clamp(min=0.05)   # cs=0 时 α 降到 5% 的基础值
+            beta_effective = beta * (2.0 - cs).clamp(max=1.5)  # cs=0 时 β 放大到 1.5 倍
+        else:
+            alpha_effective = alpha
+            beta_effective = beta
+
+        # ====== 5. 融合: G_c 为主体 + 历史增量 + slot 偏置 ======
+        Z_d_new = G_c + alpha_effective * history_delta + beta_effective * slot_bias
+
+        # ====== 6. 输出归一化 ======
+        Z_d_new = self.output_norm(Z_d_new)
+
+        return Z_d_new
+
+
+class LatentDraftFlow(nn.Module):
+    """
+    隐空间流 (Latent Draft Flow): 将 latent draft 视为连续演化的隐空间信号流
+    
+    设计理念:
+    - 摒弃"一致性检验"范式 (ConsistencyHead、二次检索验证、自适应纠错 MLP 等)
+    - 把 Z_d 看成在隐空间中流动的状态, 每一步通过与当前推理状态和视觉信息的交互来演化
+    - 类似 Neural ODE / Flow Matching: Z_d 是一个连续演化的流, 不是离散的"检验→修正"
+    
+    核心信号流 (两步 CA, 简洁直接):
+      Stage 1 — 历史融合: 当前推理状态从历史 draft 中读取上下文
+        H_c = CA(Q=S_c, KV=Z_d_prev)
+      
+      Stage 2 — 视觉锚定: 融合后的状态从视觉信息中锚定/修正
+        Z_d_new = CA(Q=H_c, KV=visual_hidden)
+      
+      Stage 3 — 归一化
+        Z_d_new = RMSNorm(Z_d_new)
+    
+    与旧架构的关键区别:
+    - 旧架构: S_c → BidirectionalReflection(二次检索+ConsistencyHead+纠错MLP) → G_c
+              → CurrentDominantDraftRefiner(G_c+α·CA(G_c,Z_d_prev)+β·bias) → Z_d_new
+              信号流长, 有 3 个 ConsistencyHead, 2 个纠错 MLP, 多个门控标量
+    - 新架构: S_c → CA(S_c, Z_d_prev) → CA(H_c, VH) → LayerScale 残差 → Z_d_new
+              信号流短, 无一致性分数, 无纠错 MLP, 无门控标量
+    
+    为什么这个设计更好:
+    1. 去掉了所有"伪一致性"信号: 不再用 CA 增量冒充一致性
+    2. 信号流更短更直接: S_c → 两步 CA → Z_d_new
+    3. Z_d 真正成为"流": 每一步都是前一步 Z_d 与当前推理+视觉交互的结果
+    4. slot 分化天然保证: 两步 CA 中每个 slot 独立做 attention
+    5. 参数量更少: ~2.4M (两个轻量 CA) vs ~8.6M (BidirectionalReflection + DraftRefiner)
+    
+    LayerScale 更新策略 (替代固定 Δt 残差步进):
+    - 借鉴 CaiT/DeiT-III 的 LayerScale 技术
+    - per-slot 可学习缩放因子 γ_i, 零初始化 → 恒等路径
+    - Z_d_new = Z_d_prev + γ_i · (flow_target - Z_d_prev)
+    - 优势: 无超参数, per-slot 差异化, 训练自动调节更新幅度
+    - 秩坍塌防护: γ_i=0 时 Z_d_new=Z_d_prev, 保持正交初始化的 slot 多样性
+    
+    Args:
+        d_z: controller 空间维度 (768)
+        num_heads: cross-attention 头数 (8)
+        num_draft_slots: draft slot 数量 K_d (默认 16, 用于 LayerScale 参数维度)
+        max_steps: [已废弃, 保留用于兼容旧 checkpoint] 旧版残差步进的 Δt = 1/C
+    """
+
+    def __init__(self, d_z: int = 768, num_heads: int = 8, num_draft_slots: int = 16, max_steps: int = 7):
+        super().__init__()
+        self.d_z = d_z
+        self.num_heads = num_heads
+        self.head_dim = d_z // num_heads
+        self.max_steps = max_steps  # [已废弃] 保留用于兼容旧 checkpoint
+        self.num_draft_slots = num_draft_slots
+
+        # ====== Stage 1: 历史融合 CA (轻量, 无 FFN) ======
+        # Q=S_c [B, K_d, d_z], KV=Z_d_prev [B, K_d, d_z]
+        # 每个 S_c slot 独立从 Z_d_prev 中读取不同的历史信息 → slot 分化
+        self.history_q_norm = RMSNorm(d_z)
+        self.history_kv_norm = RMSNorm(d_z)
+        self.history_q_proj = nn.Linear(d_z, d_z, bias=False)
+        self.history_k_proj = nn.Linear(d_z, d_z, bias=False)
+        self.history_v_proj = nn.Linear(d_z, d_z, bias=False)
+        self.history_o_proj = nn.Linear(d_z, d_z, bias=False)
+
+        # ====== Stage 2: 视觉锚定 CA (完整 CrossAttentionBlock, 含 FFN) ======
+        # Q=H_c [B, K_d, d_z], KV=visual_hidden [B, ~500, d_z]
+        # 从 ~500 个视觉 token 中检索与当前推理相关的证据, 锚定/修正 draft
+        # 使用完整 CA (含 FFN): 视觉信息量大 (~500 tokens), 需要更强的表达能力
+        self.visual_ca = CrossAttentionBlock(d_model=d_z, num_heads=num_heads)
+
+        # ====== 层间归一化: 防止两步 CA 残差叠加导致范数爆炸 ======
+        self.inter_norm = RMSNorm(d_z)
+
+        # ====== 输出归一化 ======
+        self.output_norm = RMSNorm(d_z)
+
+        # ====== LayerScale: per-slot 可学习缩放因子 (替代固定 Δt 残差步进) ======
+        # 初始值 0.1: 训练初期 Z_d_new = Z_d_prev + 0.1·velocity (温和更新)
+        # 每个 slot 独立学习自己的更新幅度, 避免全局 dt 的一刀切
+        # 灵感来源: CaiT (Touvron et al., ICCV 2021), DeiT-III (Touvron et al., ECCV 2022)
+        #
+        # 为什么不用零初始化:
+        #   零初始化时 Z_d_new = Z_d_prev (恒等路径), draft 完全不更新
+        #   训练 400 步后 γ 均值仅 -0.0034, 说明零初始化太保守, draft 更新信号太弱
+        #   CaiT 原文推荐浅层网络用 1e-4, 但我们的 LatentDraftFlow 只有 2 个 CA stage
+        #   且 velocity = flow_target - Z_d_prev 已经是有意义的方向, 不需要从零开始探索
+        #   0.1 让 draft 从训练一开始就有 10% 的有效更新, 加速收敛
+        self.slot_scale = nn.Parameter(torch.ones(1, num_draft_slots, 1) * 0.1)  # [1, K_d, 1]
+
+        # ====== 初始化策略 ======
+        # history CA 的 o_proj 小初始化: 初始时历史融合输出 ≈ 0, S_c 主导
+        nn.init.normal_(self.history_o_proj.weight, std=0.01)
+
+    def _history_cross_attention(
+        self,
+        query: torch.Tensor,     # [B, K_d, d_z]
+        key_value: torch.Tensor,  # [B, K_d, d_z]
+    ) -> torch.Tensor:
+        """
+        轻量 Cross-Attention (无 FFN, 无残差连接)
+        
+        与完整 CrossAttentionBlock 的区别:
+        - 无 FFN: 历史 draft 只有 16 个 slot, 不需要 FFN 的额外表达能力
+        - 无残差连接: 输出是纯 attention 结果, 由调用方决定如何融合
+        
+        Returns:
+            attn_output: [B, K_d, d_z] 纯 attention 输出 (无残差)
+        """
+        B, L_q, D = query.shape
+        _, L_kv, _ = key_value.shape
+
+        q = self.history_q_norm(query)
+        kv = self.history_kv_norm(key_value)
+
+        q = self.history_q_proj(q).view(B, L_q, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.history_k_proj(kv).view(B, L_kv, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.history_v_proj(kv).view(B, L_kv, self.num_heads, self.head_dim).transpose(1, 2)
+
+        scale = math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / scale
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn_output = torch.matmul(attn_weights, v)
+
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, L_q, D)
+        attn_output = self.history_o_proj(attn_output)
+
+        return attn_output
+
+    def forward(
+        self,
+        S_c: torch.Tensor,              # [B, K_d, d_z] 当前推理状态 (step 摘要或轨迹)
+        Z_d_prev: torch.Tensor,          # [B, K_d, d_z] 上一步的 draft state (历史流)
+        visual_hidden: torch.Tensor,     # [B, L_v, d_z] 投影后的完整视觉 hidden (~500 tokens)
+    ) -> torch.Tensor:
+        """
+        隐空间流演化 (残差步进): S_c + Z_d_prev + visual_hidden → Z_d_new
+        
+        核心公式:
+          flow_target = CA_full(Q=RMSNorm(S_c + CA_light(S_c, Z_d_prev)), KV=visual_hidden)
+          velocity = flow_target - Z_d_prev
+          Z_d_new = Z_d_prev + γ_i · velocity    (γ_i: per-slot 可学习, 零初始化)
+        
+        信号流:
+        1. history_delta = CA(Q=S_c, KV=Z_d_prev): 从历史 draft 中读取上下文
+        2. H_c = S_c + history_delta: 融合当前推理与历史上下文
+        3. H_c_normed = RMSNorm(H_c): 层间归一化, 防止范数爆炸
+        4. flow_target = CA(Q=H_c_normed, KV=visual_hidden): 从视觉中锚定/修正
+        5. velocity = flow_target - Z_d_prev: 计算速度场
+        6. Z_d_new = Z_d_prev + γ_i · velocity: LayerScale 残差 (恒等路径保持 slot 多样性)
+        7. 软范数裁剪: 防止多步累积后范数爆炸
+        
+        关键设计:
+        - LayerScale: per-slot 可学习缩放因子 γ_i, 初始化为 0.1 → 温和更新路径
+        - 恒等路径: 当 γ_i→0 时 Z_d_new→Z_d_prev, slot 多样性通过 Z_d_prev 的正交基底保留
+        - 雅可比矩阵: ∂Z_new/∂Z_prev = I + γ_i·J, 主对角线为 1, 无梯度消失
+        - 自适应步长: 每个 slot 独立学习更新幅度, 无需手动调 dt 超参数
+        
+        Args:
+            S_c: [B, K_d, d_z] 当前推理状态
+            Z_d_prev: [B, K_d, d_z] 上一步的 draft state
+            visual_hidden: [B, L_v, d_z] 投影后的完整视觉 hidden
+        
+        Returns:
+            Z_d_new: [B, K_d, d_z] 演化后的 draft state
+        """
+        param_dtype = self.history_q_proj.weight.dtype
+        S_c = S_c.to(param_dtype)
+        Z_d_prev = Z_d_prev.to(param_dtype)
+        visual_hidden = visual_hidden.to(param_dtype)
+
+        # ====== Stage 1: 历史融合 ======
+        # S_c 从历史 draft 中读取上下文 (per-slot 独立 attention → slot 分化)
+        history_delta = self._history_cross_attention(S_c, Z_d_prev)  # [B, K_d, d_z]
+        H_c = S_c + history_delta  # 残差融合: 当前推理 + 历史上下文
+
+        # ====== 层间归一化 ======
+        H_c = self.inter_norm(H_c)
+
+        # ====== Stage 2: 视觉锚定 ======
+        # 从 ~500 个视觉 token 中检索与当前推理相关的证据
+        # 完整 CrossAttentionBlock (含 FFN + 残差): 视觉信息量大, 需要更强的表达能力
+        flow_target = self.visual_ca(query=H_c, key_value=visual_hidden)  # [B, K_d, d_z]
+
+        # ====== Stage 3: LayerScale 残差 (per-slot 可学习步长, 防止 slot 坍塌) ======
+        # velocity = flow_target - Z_d_prev: 从当前位置指向目标位置的速度场
+        # Z_d_new = Z_d_prev + γ_i · velocity: γ_i 初始化为 0.1, 训练自动调节
+        # 初始时 Z_d_new = Z_d_prev + 0.1·velocity → 温和更新, 保持 slot 多样性
+        # 与固定 dt=1/C 的区别: 每个 slot 独立学习更新幅度, 无超参数
+        velocity = flow_target - Z_d_prev
+        Z_d_new = Z_d_prev + self.slot_scale * velocity
+
+        # ====== Stage 4: 软范数裁剪 (防止多步累积后范数爆炸, 保留 slot 间范数差异) ======
+        max_norm = math.sqrt(self.d_z / 512) * 35  # 根据 d_z 动态计算, d_z=768 时 max_norm≈42.9
         slot_norms = Z_d_new.norm(dim=-1, keepdim=True).clamp(min=1e-8)  # [B, K_d, 1]
         clamped_scale = (max_norm / slot_norms).clamp(max=1.0)
         Z_d_new = Z_d_new * clamped_scale
@@ -1228,3 +2154,148 @@ d_z: int = 768,
         # 使用最后一个注入点的 adapter
         last_idx = str(self.injection_layer_indices[-1])
         return self.adapters[last_idx](hidden_states, draft_states, inject_weight=inject_weight)
+
+
+class PrefixKVProjector(nn.Module):
+    """
+    Prefix KV 投影器: 将 Z_d [B, K_d, d_z] 投影为注入层的 prefix K/V
+    
+    核心设计:
+    - 每个注入层有独立的 K/V 投影头 (不共享参数)
+    - 输出格式与 Qwen3-VL 的 GQA 对齐: K/V shape = [B, num_kv_heads, N_p, head_dim]
+    - 不施加 RoPE (位置无关的全局控制信号, 等效于 position=0)
+    - K 投影后施加 RMSNorm (与基座 Qwen3VLTextAttention 的 k_norm 对齐)
+    - prefix KV 作为虚拟 token, 与 real token 在 attention 中平等竞争
+      (不使用 scale 门控, 训练稳定性通过初始化策略保证: K 小范围初始化, V 零初始化)
+    
+    flash_attention_2 兼容性:
+    - prefix KV 通过 DynamicCache.update() 拼接到真实 KV 前面
+    - flash_attn 原生支持 KV_len > Q_len (这就是 KV cache 的标准用法)
+    - causal mask: Q[i] 可以看到 K[j] where j <= i + N_p (prefix 对所有 Q 可见)
+    - 不需要自定义 attention_mask, 不需要修改 position_ids
+    
+    参数量估算 (d_z=768, num_kv_heads=8, head_dim=128, 3 注入层):
+    - 每层: K_proj(768→1024) + V_proj(768→1024) + K_norm(128) = ~1.57M
+    - 3 层总计: ~4.7M
+    
+    Args:
+        d_z: controller 空间维度 (768)
+        num_kv_heads: GQA 的 KV 头数 (Qwen3-VL-8B: 8)
+        head_dim: 每个头的维度 (Qwen3-VL-8B: 128)
+        injection_layers: 注入层索引列表 (如 [18, 26, 35])
+    """
+
+    def __init__(
+        self,
+        d_z: int = 768,
+        num_kv_heads: int = 8,
+        head_dim: int = 128,
+        injection_layers: list = None,
+    ):
+        super().__init__()
+        if injection_layers is None:
+            injection_layers = [18, 26, 35]
+        self.d_z = d_z
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.kv_dim = num_kv_heads * head_dim  # Qwen3-VL-8B: 8 * 128 = 1024
+        self.injection_layers = sorted(injection_layers)
+
+        # 每个注入层独立的 K/V 投影
+        self.k_projs = nn.ModuleDict({
+            str(l): nn.Linear(d_z, self.kv_dim, bias=False)
+            for l in self.injection_layers
+        })
+        self.v_projs = nn.ModuleDict({
+            str(l): nn.Linear(d_z, self.kv_dim, bias=False)
+            for l in self.injection_layers
+        })
+
+        # K 投影后施加 RMSNorm (与基座 Qwen3VLTextAttention 的 k_norm 对齐)
+        # 基座的 k_norm 是 per-head 的 RMSNorm(head_dim)
+        self.k_norms = nn.ModuleDict({
+            str(l): RMSNorm(head_dim)
+            for l in self.injection_layers
+        })
+
+        # 虚拟 token 初始化: K 小范围初始化 + V 零初始化
+        # 这样初始时 prefix V = 0, 即使被 attend 到也不影响输出
+        # 随训练逐步学到有意义的 V 值 (类似 LoRA 的 B 矩阵零初始化)
+        self._init_weights()
+
+    def _init_weights(self):
+        """虚拟 token 初始化策略:
+        - K 投影: 小范围正态初始化 (std=0.02), 让 prefix 在 attention 中有合理的竞争力
+        - V 投影: 零初始化, 初始时 prefix 对输出无影响, 随训练逐步学到有意义的值
+        这样不需要 scale 门控, prefix 天然从"无影响"状态开始, 逐步增强
+        """
+        for proj in self.k_projs.values():
+            nn.init.normal_(proj.weight, std=0.02)
+        for proj in self.v_projs.values():
+            nn.init.zeros_(proj.weight)
+
+    def forward(
+        self,
+        Z_d: torch.Tensor,     # [B, K_d, d_z]
+        layer_idx: int,
+    ) -> tuple:
+        """
+        将 Z_d 投影为指定层的 prefix K/V
+        
+        Args:
+            Z_d: [B, K_d, d_z] 当前 draft state
+            layer_idx: 注入层索引
+        
+        Returns:
+            prefix_k: [B, num_kv_heads, K_d, head_dim]
+            prefix_v: [B, num_kv_heads, K_d, head_dim]
+        """
+        B, K_d, _ = Z_d.shape
+        l_str = str(layer_idx)
+        input_dtype = Z_d.dtype  # 记录输入 dtype (通常是 bfloat16)
+
+        # dtype 对齐: 将输入 cast 到参数 dtype 进行计算, 输出再 cast 回输入 dtype
+        # Accelerate bf16 混合精度会将可训练参数 upcast 到 float32 (master weights),
+        # 不应修改参数 dtype (会破坏 Accelerate 的精度管理), 而是在输入/输出处 cast
+        proj_dtype = self.k_projs[l_str].weight.dtype
+        Z_d_compute = Z_d.to(proj_dtype) if Z_d.dtype != proj_dtype else Z_d
+
+        # 投影到 KV 空间
+        k = self.k_projs[l_str](Z_d_compute)  # [B, K_d, kv_dim]
+        v = self.v_projs[l_str](Z_d_compute)  # [B, K_d, kv_dim]
+
+        # Reshape 为 [B, K_d, num_kv_heads, head_dim]
+        k = k.view(B, K_d, self.num_kv_heads, self.head_dim)
+        v = v.view(B, K_d, self.num_kv_heads, self.head_dim)
+
+        # K norm (与基座 Qwen3VLTextAttention 的 k_norm 对齐)
+        k = self.k_norms[l_str](k)
+
+        # 转置为 [B, num_kv_heads, K_d, head_dim] (与 DynamicCache 格式对齐)
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+
+        # 输出 cast 回输入 dtype: 确保 prefix KV 与基座模型 KV cache dtype 一致
+        # (计算在 float32 精度下完成, 输出转回 bfloat16 与基座模型兼容)
+        if k.dtype != input_dtype:
+            k = k.to(input_dtype)
+            v = v.to(input_dtype)
+
+        return k, v
+
+    def get_all_prefix_kvs(
+        self,
+        Z_d: torch.Tensor,     # [B, K_d, d_z]
+    ) -> dict:
+        """
+        一次性计算所有注入层的 prefix K/V
+        
+        Returns:
+            prefix_kvs: {layer_idx: (prefix_k, prefix_v)} 字典
+                prefix_k: [B, num_kv_heads, K_d, head_dim]
+                prefix_v: [B, num_kv_heads, K_d, head_dim]
+        """
+        result = {}
+        for layer_idx in self.injection_layers:
+            result[layer_idx] = self.forward(Z_d, layer_idx)
+        return result

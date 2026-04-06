@@ -1,29 +1,35 @@
 """RLD Model: 包装 Qwen3-VL VLM 的 Reflective Latent Draft 模型
 
-重构版架构: 单次全序列前向 + delimiter 门控的 recurrent draft + readout adapter
+Full KV Cache Chunkwise Training 方案: 按 step boundary 切 chunks, 每个 chunk 使用对应 Z_d 的 prefix KV + 完整历史 KV cache
 
 核心设计:
-1. 冻结 Qwen3-VL 全部参数
-2. 只训练 RLD Controller + DraftReadoutAdapter 的外挂模块 (< 30M 参数)
-3. 训练时:
-   a. 对完整序列只跑一次 teacher-forcing forward (no_grad)
-   b. 从 hidden states 按 </step> 边界切出 step summaries
-   c. recurrent controller 扫描 → Z_d_0, Z_d_1, ..., Z_d_C
-   d. DraftReadoutAdapter(H, Z_d_expanded) → adapted_hidden → logits
-   e. 全局 CE loss
-4. 推理时也用 readout adapter (训推一致)
-   a. 每生成一个 token，用 readout_adapter 修正 hidden → logits
-   b. 遇到 </step> 时更新 Z_d (controller.step_update)
-   c. 无需 prefix KV cache，无需 hook
+1. 基座 L0~L27 冻结, L28~L35 通过 LoRA 协同训练 (Draft Evolver + VLM 协同)
+2. 训练 RLD Controller + PrefixKVProjector + LoRA (~29M 参数)
+3. 训练时 (Full KV Cache Chunkwise Training, 训推完全一致):
+   a. 按 step boundary 将序列切分为 chunks
+   b. 维护完整的 per-layer KV cache (detach, 只提供历史上下文)
+   c. 对每个 chunk:
+      - Z_d_c → PrefixKVProjector → prefix K/V (有梯度)
+      - 注入层: [prefix_KV + 历史 KV cache (detach)] → 当前 chunk token 能看到所有历史
+      - 非注入层: [历史 KV cache (detach)] → 当前 chunk token 能看到所有历史
+      - 36 层 forward (有梯度, LoRA 层有可训练增量)
+      - 从 chunk hidden 提取 step summary S_c
+      - controller update: S_c → T_c → G_c → Z_d_{c+1}
+      - 将当前 chunk 的 KV detach 后追加到历史 KV cache
+   d. concat 所有 chunk hidden → logits → CE loss
+   e. 每个 Z_d_c 都有来自 CE loss 的直接梯度 (训推一致)
+4. 推理时:
+   a. prefix KV 写入 DynamicCache 头部, 后续 token 自然看到
+   b. 遇到 step boundary 时更新 Z_d → 覆写 cache 中 prefix 位置的 KV
+   c. 完全兼容 flash_attention_2 (KV_len > Q_len 是标准 KV cache 用法)
 
-与旧版段循环方案的区别:
-- 不再有分段多次 forward
-- 不再有训练时 cache rewrite
-- 训推一致: 训练和推理都使用 readout adapter
-- 所有 rank 的调用图完全一致 (彻底消除 cross-rank CUDA error)
-- 速度提升 ~20x (从 ~100s/step 降到 ~4s/step)
+LoRA 协同训练:
+- LoRA 让注入层 (L28~L35) 的 Q/V 投影学会更好地"查询"和"协调" prefix KV
+- LoRA 参数量极小 (~4M), 不会显著增加显存
+- 差异化学习率: Controller/PrefixKVProjector lr=1e-4, LoRA lr=3e-5
 """
 import os
+import re
 import math
 import torch
 import torch.nn as nn
@@ -36,7 +42,14 @@ from transformers.cache_utils import DynamicCache as _RawDynamicCache
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
 from .controller import RLDController
-from .modules import DraftReadoutAdapter, MultiLayerDraftReadout, InSituDraftInjector
+from .modules import PrefixKVProjector
+
+# LoRA 支持 (Stage 2)
+try:
+    from peft import LoraConfig, get_peft_model, PeftModel
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
 
 # ============================================================
 # DynamicCache 兼容层: 仍保留给推理路径使用
@@ -129,26 +142,33 @@ class RLDModel(nn.Module):
     """
     RLD Model: Qwen3-VL + Reflective Latent Draft Controller
     
-    重构版架构 (训练时单次全序列前向 + readout adapter):
+    Chunkwise Prefix KV Training 架构:
     ┌──────────────────────────────────────────────────────────────┐
-    │  训练流程:                                                    │
+    │  训练流程 (Chunkwise Prefix KV Training):                     │
     │  1. 视觉 encoder → visual_tokens → Z_e (证据槽)              │
-    │  2. 冻结 base model 对完整序列做一次 forward (no_grad)        │
-    │     → H_{1:T} (全序列 hidden states)                        │
-    │  3. 按 </step> 边界从 H 切出 step summaries → S_c   │
-    │  4. Recurrent controller 扫描 → Z_d_0, Z_d_1, ..., Z_d_C
-    │  5. 将 Z_d 按 step 展开到 token 级 → [B, T, K_d, d_z]
-    │  6. DraftReadoutAdapter(H, Z_d_expanded) → adapted_hidden → logits
-    │  7. 全局 CE loss
+    │  2. controller.prefill → Z_d_0 (有梯度)                      │
+    │  3. 按 step boundary 切分序列为 chunks                        │
+    │  4. 对每个 chunk_c:                                           │
+    │     a. Z_d_c → PrefixKVProjector → prefix K/V_c              │
+    │     b. 36 层 forward (注入层使用 prefix K/V_c)                │
+    │     c. 从 chunk hidden 提取 step summary S_c                  │
+    │     d. controller: S_c → T_c → G_c → Z_d_{c+1}              │
+    │  5. concat 所有 chunk hidden → logits → CE loss               │
+    │  6. 每个 Z_d_c 都有来自 CE loss 的直接梯度                    │
     │                                                               │
     │  推理流程 (训推一致):                                          │
-    │  - 标准 KV cache 自回归 + 每 token readout adapter 修正        │
-    │  - 遇到 </step> 时 controller.step_update 更新 Z_d             │
-    │  - 无需 prefix KV, 无需 hook, 无需多次 forward                │
+    │  - prefix KV 写入 DynamicCache 头部, 后续 token 自然看到      │
+    │  - 遇到 step boundary 时更新 Z_d → 覆写 cache 中 prefix KV   │
+    │  - 完全兼容 flash_attention_2                                 │
     └──────────────────────────────────────────────────────────────┘
     """
 
-    STEP_DELIMITER = "</step>"
+    # Step boundary 检测: 新格式使用 "Step N:" (N>=2) 和 "Final Answer:" 作为 boundary
+    # 保留旧常量用于兼容
+    STEP_DELIMITER = "</step>"  # 旧格式兼容
+    # 新格式 boundary 标记
+    STEP_PATTERN = re.compile(r'Step\s+(\d+)\s*[:.\s]', re.IGNORECASE)
+    FINAL_ANSWER_PATTERN = re.compile(r'Final\s+Answer\s*:', re.IGNORECASE)
 
     def __init__(
         self,
@@ -162,15 +182,15 @@ class RLDModel(nn.Module):
         torch_dtype: torch.dtype = torch.bfloat16,
         attn_implementation: str = "flash_attention_2",
         lambda_div: float = 0.01,
-        lambda_kl: float = 0.1,
         max_scale: float = 0.3,
         selective_injection: bool = True,
+        use_trace_updater: bool = True,
+        use_bidirectional_reflection: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.d_z = d_z
         self.total_layers = total_layers
-        self.lambda_kl = lambda_kl
         self.max_scale = max_scale
         self.selective_injection = selective_injection
         self._verbose = _is_main_process()
@@ -215,51 +235,178 @@ class RLDModel(nn.Module):
             total_layers=total_layers,
             num_heads=8,
             evidence_layers=2,
-            use_gate=True,  # [已废弃] 保留兼容旧配置
             lambda_div=lambda_div,
             max_steps=14,
+            use_trace_updater=use_trace_updater,
+            use_bidirectional_reflection=use_bidirectional_reflection,
         )
 
         # 确保 controller 使用与基座相同的 dtype
         self.controller = self.controller.to(dtype=torch_dtype)
 
-        # ====== 3. 创建 InSituDraftInjector (Top-K Rerun 方案, Phase 3: K=8, 3注入点) ======
-        # Phase 3: K=8, 重算最后 8 层 (L28-L35), 3 个注入点 (L28, L31, L35)
-        # 修正后的 hidden 在 L28-L35 层间通过 self-attention 传播,
-        # 实现 "draft 真正影响后续 token 生成" 的因果一致性。
-        self.rerun_k = 8  # Phase 3: 重算最后 8 层
-        self.readout_adapter = InSituDraftInjector(
-            hidden_size=hidden_size,
+        # ====== 3. 创建 PrefixKVProjector (Persistent Prefix Memory 方案) ======
+        # 核心思想: 将 Z_d 投影为中高层 attention 的 prefix K/V slots
+        # 注入层: L18, L26, L35 (均匀覆盖中层语义组合→高层推理→输出决策)
+        # prefix KV 通过 DynamicCache 注入, 完全兼容 flash_attention_2
+        # 训练时: 单 Pass 全序列有梯度, 注入层通过 per-layer prefix cache 注入
+        # 推理时: prefix KV 写入 DynamicCache 头部, 覆写更新
+        self.injection_layer_indices = [18, 26, 35]  # 中层+高层注入点
+        self.num_prefix_slots = num_draft_slots  # prefix slots 数 = draft slots 数 (16)
+
+        # 从基座 config 获取 GQA 参数
+        text_config = self.base_model.config.text_config if hasattr(self.base_model.config, 'text_config') else self.base_model.config
+        self.num_kv_heads = getattr(text_config, 'num_key_value_heads', 8)
+        self.head_dim = getattr(text_config, 'head_dim', text_config.hidden_size // text_config.num_attention_heads)
+
+        self.prefix_kv_projector = PrefixKVProjector(
             d_z=d_z,
-            num_heads=8,
-            total_layers=total_layers,
-            rerun_k=self.rerun_k,
-            injection_offsets=[0, 3, 7],  # Phase 3: L28, L31, L35
-            max_scale=max_scale,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            injection_layers=self.injection_layer_indices,
         )
-        self.readout_adapter = self.readout_adapter.to(dtype=torch_dtype)
+        self.prefix_kv_projector = self.prefix_kv_projector.to(dtype=torch_dtype)
+
+
 
         if self._verbose:
             self.controller.print_param_summary()
-            adapter_params = sum(p.numel() for p in self.readout_adapter.parameters() if p.requires_grad)
-            print(f"[RLD] InSituDraftInjector 参数: {adapter_params:,} ({adapter_params/1e6:.2f}M)")
-            print(f"[RLD]   Top-K Rerun: K={self.rerun_k}, rerun_start=L{self.readout_adapter.rerun_start}")
-            print(f"[RLD]   注入层索引: {self.readout_adapter.injection_layer_indices}")
-            print(f"[RLD]   Scale 上界: {max_scale}")
-            print(f"[RLD]   KL 散度正则化: lambda_kl={lambda_kl}")
-            print(f"[RLD]   选择性注入: {selective_injection}")
-            for idx_str, adapter in self.readout_adapter.adapters.items():
-                print(f"[RLD]   Layer {idx_str}: scale={adapter.scale.item():.2f}")
+            projector_params = sum(p.numel() for p in self.prefix_kv_projector.parameters() if p.requires_grad)
+            print(f"[RLD] PrefixKVProjector 参数: {projector_params:,} ({projector_params/1e6:.2f}M)")
+            print(f"[RLD]   注入层索引: {self.injection_layer_indices}")
+            print(f"[RLD]   Prefix slots: {self.num_prefix_slots}")
+            print(f"[RLD]   GQA: num_kv_heads={self.num_kv_heads}, head_dim={self.head_dim}")
+            print(f"[RLD]   Prefix KV: 虚拟 token 模式 (无 scale 门控, V 零初始化)")
 
-        # ====== 4. Step delimiter token ids ======
+        # ====== 4. LoRA 状态标记 ======
+        self._lora_enabled = False
+        self._lora_layers = None  # 记录 LoRA 应用的层范围
+
+        # ====== 5. Step delimiter token ids ======
         self.step_delimiter_ids = None
         self.step_delimiter_id = None
 
+    def setup_lora(
+        self,
+        lora_r: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.05,
+        target_modules: list = None,
+        lora_layers: list = None,
+    ):
+        """
+        Stage 2: 在基座模型的指定层添加 LoRA adapter
+        
+        设计要点:
+        - 只在注入层范围内的层 (L18~L35) 添加 LoRA
+        - 与 PrefixKVProjector 的注入层对齐
+        - LoRA 参数量较小 (~9M), 不会显著增加显存
+        - 梯度路径: loss → lm_head → norm → L35(LoRA) → ... → L18(LoRA) → prefix KV → Z_d → controller
+        
+        Args:
+            lora_r: LoRA 秩 (默认 16)
+            lora_alpha: LoRA 缩放因子 (默认 32)
+            lora_dropout: LoRA dropout (默认 0.05)
+            target_modules: 目标模块名 (默认 ["q_proj", "v_proj"])
+            lora_layers: 要应用 LoRA 的层索引列表 (默认注入层范围内的层)
+        """
+        if not PEFT_AVAILABLE:
+            raise ImportError(
+                "[RLD] Stage 2 需要 peft 库。请运行: pip install peft"
+            )
+        
+        if target_modules is None:
+            target_modules = ["q_proj", "v_proj"]
+        
+        if lora_layers is None:
+            # 默认: 注入层范围内的所有层 (L18~L35)
+            lora_layers = list(range(min(self.injection_layer_indices), self.total_layers))
+        
+        self._lora_layers = lora_layers
+        
+        if self._verbose:
+            print(f"\n[RLD Stage 2] 配置 LoRA...")
+            print(f"  LoRA r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}")
+            print(f"  目标模块: {target_modules}")
+            print(f"  应用层: L{min(lora_layers)}~L{max(lora_layers)} ({len(lora_layers)} 层)")
+        
+        lora_config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=target_modules,
+            layers_to_transform=lora_layers,
+            lora_dropout=lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        
+        # 应用 LoRA 到基座模型
+        # ★ autocast_adapter_dtype=False: 阻止 PEFT 将 bfloat16 LoRA 权重 upcast 到 float32
+        # PEFT 默认会将 bf16/fp16 的 adapter 权重转为 fp32 (用于标准 HF forward 的稳定性),
+        # 但我们手动展开 decoder layer 循环, fp32 LoRA 权重会导致 backward 时
+        # "Expected BFloat16, got Float" 错误 (ToCopyBackward 将梯度从 bf16 转为 fp32)
+        self.base_model = get_peft_model(self.base_model, lora_config, autocast_adapter_dtype=False)
+        self._lora_enabled = True
+        
+        # ★ 强制确保 LoRA 参数与基座模型 dtype 一致 (双重保险)
+        # autocast_adapter_dtype=False 应该已经阻止了 upcast, 但某些 PEFT 版本可能仍然 upcast
+        # 这里显式将所有 LoRA 参数转回基座模型的 dtype
+        # 从冻结的基座参数中获取 dtype (跳过 LoRA 参数)
+        _base_dtype = torch.bfloat16  # 默认值
+        for name, param in self.base_model.named_parameters():
+            if 'lora_' not in name:
+                _base_dtype = param.dtype
+                break
+        _lora_fp32_count = 0
+        for name, param in self.base_model.named_parameters():
+            if 'lora_' in name and param.dtype != _base_dtype:
+                param.data = param.data.to(_base_dtype)
+                _lora_fp32_count += 1
+        if _lora_fp32_count > 0 and self._verbose:
+            print(f"  ⚠️ 已将 {_lora_fp32_count} 个 LoRA 参数从 float32 转为 {_base_dtype}")
+        
+        # 统计 LoRA 参数
+        lora_params = sum(p.numel() for p in self.base_model.parameters() if p.requires_grad)
+        if self._verbose:
+            print(f"  LoRA 可训练参数: {lora_params:,} ({lora_params/1e6:.2f}M)")
+            self.base_model.print_trainable_parameters()
+            # 诊断: 打印 LoRA 参数 dtype 确认
+            for name, param in self.base_model.named_parameters():
+                if 'lora_A' in name and param.requires_grad:
+                    print(f"  LoRA 参数 dtype 确认: {name} → {param.dtype}")
+                    break
+            print(f"[RLD Stage 2] ✅ LoRA 已启用\n")
+
+    @property
+    def _inner_model(self):
+        """透明获取内部 Qwen3VL 模型 (兼容 LoRA 包装)
+        
+        peft.get_peft_model() 会在 base_model 外面包一层 PeftModel:
+        - 无 LoRA: self.base_model.model → Qwen3VLModel
+        - 有 LoRA: self.base_model.base_model.model.model → Qwen3VLModel
+        
+        此属性统一返回 Qwen3VLModel (包含 .visual, .language_model 等)
+        """
+        if self._lora_enabled:
+            # PeftModel 包装: base_model → PeftModel → base_model → LoraModel → model → Qwen3VLForConditionalGeneration → model
+            peft_base = self.base_model.base_model  # LoraModel
+            original_model = peft_base.model  # Qwen3VLForConditionalGeneration
+            return original_model.model  # Qwen3VLModel
+        return self.base_model.model
+
+    @property
+    def _lm_head(self):
+        """透明获取 lm_head (兼容 LoRA 包装)"""
+        if self._lora_enabled:
+            peft_base = self.base_model.base_model  # LoraModel
+            original_model = peft_base.model  # Qwen3VLForConditionalGeneration
+            return original_model.lm_head
+        return self.base_model.lm_head
     def set_processor(self, processor):
         """设置 processor 并获取 delimiter token id 序列"""
         self.processor = processor
         tokenizer = processor.tokenizer
 
+        # 旧格式 delimiter (保留用于兼容)
         delimiter_ids = tokenizer.encode(self.STEP_DELIMITER, add_special_tokens=False)
         self.step_delimiter_ids = delimiter_ids
         if len(delimiter_ids) == 1:
@@ -267,11 +414,20 @@ class RLDModel(nn.Module):
         else:
             self.step_delimiter_id = None
 
+        # 新格式: 预编码常用 boundary token 序列
+        # "Step " 的 token ids (用于推理时检测 "Step N:")
+        self._step_prefix_ids = tokenizer.encode("Step ", add_special_tokens=False)
+        # "Final Answer:" 的 token ids
+        self._final_answer_ids = tokenizer.encode("Final Answer:", add_special_tokens=False)
+        # "\nStep " 的 token ids (带换行前缀, 更精确匹配)
+        self._newline_step_ids = tokenizer.encode("\nStep ", add_special_tokens=False)
+
         if self._verbose:
             decoded = tokenizer.decode(delimiter_ids)
-            print(f"[RLD] Step delimiter: '{self.STEP_DELIMITER}' → token_ids={delimiter_ids} (decoded='{decoded}')")
-            if len(delimiter_ids) > 1:
-                print(f"[RLD]   使用多 token 后缀匹配模式 (共 {len(delimiter_ids)} 个 token)")
+            print(f"[RLD] Step delimiter (旧): '{self.STEP_DELIMITER}' → token_ids={delimiter_ids}")
+            print(f"[RLD] Step prefix (新): 'Step ' → token_ids={self._step_prefix_ids}")
+            print(f"[RLD] Final Answer (新): 'Final Answer:' → token_ids={self._final_answer_ids}")
+            print(f"[RLD] 新格式: 使用 'Step N:' (N>=2) 和 'Final Answer:' 作为 boundary")
 
     def _get_full_attn_cache_len(self, past_key_values) -> int:
         """安全获取 KV cache 序列长度 (推理用)"""
@@ -284,17 +440,68 @@ class RLDModel(nn.Module):
         return past_key_values.get_seq_length() if past_key_values is not None else 0
 
     def _find_delimiter_positions(self, token_ids: torch.Tensor) -> List[int]:
-        """在 token 序列中查找所有 </step> delimiter 的末尾位置"""
-        if self.step_delimiter_ids is None:
-            return []
-        delim = self.step_delimiter_ids
-        delim_len = len(delim)
-        positions = []
-        seq = token_ids.tolist()
-        for i in range(delim_len - 1, len(seq)):
-            if seq[i - delim_len + 1 : i + 1] == delim:
-                positions.append(i)
-        return positions
+        """
+        在 token 序列中查找 step boundary 位置 (训练时 fallback 用)
+        
+        新格式: 查找 "Step N:" (N>=2) 和 "Final Answer:" 的起始 token 位置
+        旧格式 (兼容): 查找 </step> 的末尾 token 位置
+        
+        注意: 训练时通常由 Collator 预计算 step_boundaries 传入,
+        此方法仅在 step_boundaries 为 None 时作为 fallback。
+        """
+        if not hasattr(self, 'processor') or self.processor is None:
+            # 无 processor, 回退到旧格式 </step> 匹配
+            if self.step_delimiter_ids is None:
+                return []
+            delim = self.step_delimiter_ids
+            delim_len = len(delim)
+            positions = []
+            seq = token_ids.tolist()
+            for i in range(delim_len - 1, len(seq)):
+                if seq[i - delim_len + 1 : i + 1] == delim:
+                    positions.append(i)
+            return positions
+        
+        # 新格式: decode 整个序列, 用正则匹配 boundary
+        tokenizer = self.processor.tokenizer
+        try:
+            # 使用 offset_mapping 精确定位
+            text = tokenizer.decode(token_ids.tolist())
+            result = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+            offsets = result['offset_mapping']
+            positions = []
+            
+            # 查找 "Step N:" (N>=2)
+            for m in re.finditer(r'Step\s+(\d+)\s*[:.\s]', text, re.IGNORECASE):
+                step_num = int(m.group(1))
+                if step_num >= 2:
+                    start_char = m.start()
+                    for tok_idx, (cs, ce) in enumerate(offsets):
+                        if cs <= start_char < ce:
+                            positions.append(tok_idx)
+                            break
+            
+            # 查找 "Final Answer:"
+            for m in re.finditer(r'Final\s+Answer\s*:', text, re.IGNORECASE):
+                start_char = m.start()
+                for tok_idx, (cs, ce) in enumerate(offsets):
+                    if cs <= start_char < ce:
+                        positions.append(tok_idx)
+                        break
+            
+            return sorted(set(positions))
+        except Exception:
+            # Fallback: 旧格式 </step> 匹配
+            if self.step_delimiter_ids is None:
+                return []
+            delim = self.step_delimiter_ids
+            delim_len = len(delim)
+            positions = []
+            seq = token_ids.tolist()
+            for i in range(delim_len - 1, len(seq)):
+                if seq[i - delim_len + 1 : i + 1] == delim:
+                    positions.append(i)
+            return positions
 
     def get_visual_tokens(
         self,
@@ -302,7 +509,7 @@ class RLDModel(nn.Module):
         image_grid_thw: torch.Tensor,
     ) -> Tuple[torch.Tensor, list]:
         """从 Qwen3-VL 的视觉编码器获取视觉 token 序列"""
-        inner_model = self.base_model.model
+        inner_model = self._inner_model
 
         _pixel_values = pixel_values.to(dtype=inner_model.visual.dtype)
         vision_output = inner_model.visual(
@@ -344,30 +551,66 @@ class RLDModel(nn.Module):
         image_grid_thw: Optional[torch.Tensor] = None,
         step_boundaries: Optional[List[List[int]]] = None,
         prompt_lens: Optional[List[int]] = None,
+        loss_weight_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """
-        训练时的前向传播 (重构版: 单次全序列前向 + readout adapter)
+        训练时的前向传播 (Chunkwise Prefix KV Training)
         
-        核心流程:
+        核心流程 (训推一致):
           1. 视觉 encoder → visual_tokens → Z_e (no_grad)
-          2. 冻结 base model 对完整序列做一次 forward (no_grad) → H_{1:T}
-          3. 按 </step> 边界从 H 切出 step summaries → S_c
-          4. recurrent controller 扫描 → Z_d_0, Z_d_1, ..., Z_d_C
-          5. 将 Z_d 按 step 展开到 token 级 → [B, T, K_d, d_z]
-          6. DraftReadoutAdapter(H, Z_d_expanded) → adapted_hidden → logits
-          7. 全局 CE loss
+          2. controller.prefill → Z_d_0 (有梯度)
+          3. 按 step boundary 切分序列为 chunks
+          4. 对每个 chunk:
+             a. Z_d_c → PrefixKVProjector → prefix K/V (有梯度)
+             b. 36 层 forward (有梯度, 注入层使用当前 prefix KV)
+             c. 从 chunk hidden 提取 step summary S_c
+             d. controller update: S_c → T_c → G_c → Z_d_{c+1}
+             e. 下一个 chunk 使用 Z_d_{c+1} 的 prefix KV
+          5. concat 所有 chunk hidden → logits → CE loss
+        
+        梯度路径 (每个 Z_d_c 都有直接梯度):
+          CE loss → logits → chunk_c hidden → prefix_KV_c → Z_d_c → controller
+          同时 Z_d_c 依赖 Z_d_{c-1} (残差连接), 梯度可回传到所有历史 draft
         
         优势:
-        - 只有 1 次 base forward (no_grad, 不持有计算图)
-        - 所有 rank 调用图完全一致
-        - 没有 cache 操作
-        - 梯度路径: loss → readout_adapter → Z_d → controller
+        - 训推完全一致: 训练和推理都是 "生成一段 → 更新 Z_d → 影响后续生成"
+        - 每个 Z_d_c 都有来自 CE loss 的直接梯度 (不再只有最后一个 Z_d 有梯度)
+        - 完全兼容 flash_attention_2
         """
         B = input_ids.shape[0]
         seq_len = input_ids.shape[1]
         device = input_ids.device
-        ctrl_dtype = next(self.controller.parameters()).dtype
+
+        # ====== dtype 对齐: Accelerate 混合精度会将可训练参数 upcast 到 float32 ======
+        # 问题: TrainingArguments(bf16=True) 时, Accelerate 的 prepare_model 会将所有
+        # requires_grad=True 的参数 upcast 到 float32 (master weights), 但基座模型冻结参数
+        # 仍然是 bfloat16。controller/prefix_kv_projector 的参数被 upcast 后, 其 forward
+        # 输出也是 float32, 与基座模型的 bf16 KV cache 拼接后, backward 时 dtype 冲突:
+        #   RuntimeError: Expected BFloat16, got Float
+        #
+        # 解决方案: 不修改参数 dtype (Accelerate 需要 float32 master weights 保证精度),
+        # 而是在 controller/prefix_kv_projector 的输出传入基座模型之前, 显式 cast 到基座 dtype。
+        # 这样 forward 计算在 float32 (精度更高), 但与基座模型交互时用 bfloat16 (兼容)。
+        if not hasattr(self, '_base_model_dtype'):
+            # 从冻结的基座参数获取 dtype (跳过 LoRA 参数)
+            self._base_model_dtype = torch.bfloat16  # 默认值
+            for _n, _p in self.base_model.named_parameters():
+                if 'lora_' not in _n:
+                    self._base_model_dtype = _p.dtype
+                    break
+            ctrl_dtype_now = next(self.controller.parameters()).dtype
+            if self._verbose:
+                print(f"[RLD] dtype 检测: 基座模型={self._base_model_dtype}, "
+                      f"controller={ctrl_dtype_now}, "
+                      f"prefix_kv_projector={next(self.prefix_kv_projector.parameters()).dtype}")
+                if ctrl_dtype_now != self._base_model_dtype:
+                    print(f"[RLD] ⚠️ controller dtype ({ctrl_dtype_now}) != 基座 dtype ({self._base_model_dtype})")
+                    print(f"[RLD]   这是 Accelerate bf16 混合精度的正常行为 (master weights 为 float32)")
+                    print(f"[RLD]   将在 controller/prefix_kv 输出处显式 cast 到 {self._base_model_dtype}")
+
+        _base_dtype = self._base_model_dtype  # 基座模型 dtype (bfloat16)
+        ctrl_dtype = next(self.controller.parameters()).dtype  # controller 参数 dtype (可能是 float32)
 
         _rank = int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
 
@@ -377,9 +620,9 @@ class RLDModel(nn.Module):
         if not hasattr(self, '_fwd_count'):
             self._fwd_count = 0
         self._fwd_count += 1
-        # 每 10 次 forward 且仅 rank 0 打印; 超 30s 异常时所有 rank 打印
+        # 每 50 次 forward 且仅 rank 0 打印; 超 30s 异常时所有 rank 打印
         _is_rank0 = (_rank == 0)
-        _should_profile = (_is_rank0 and self._fwd_count % 10 == 0)
+        _should_profile = (_is_rank0 and self._fwd_count % 50 == 0)
         _force_profile = False
 
         # ====== 显存监控: 帮助诊断 cudaErrorContained (OOM → NVLink 越界) ======
@@ -405,7 +648,7 @@ class RLDModel(nn.Module):
             deepstack_features = None
 
             if pixel_values is not None:
-                inner_model = self.base_model.model
+                inner_model = self._inner_model
                 _pixel_values = pixel_values.to(dtype=inner_model.visual.dtype)
                 vision_output = inner_model.visual(
                     _pixel_values, grid_thw=image_grid_thw
@@ -438,14 +681,19 @@ class RLDModel(nn.Module):
         # ====== 2. 初始化 RLD 状态 (controller.prefill 有梯度) ======
         rld_state = self.controller.prefill(visual_tokens)
 
-        # ====== 3. 一次性完整 base forward (no_grad) ======
+        # ====== 3. 一次性完整 base forward (全序列有梯度 + prefix KV 注入) ======
+        # 核心改造: 不再有 Pass 1 (no_grad) + Pass 2 (rerun)
+        # 而是单 Pass 全 36 层有梯度, 注入层通过 per-layer prefix KV cache 注入
+        # 梯度路径: loss → lm_head → norm → L35 → ... → L28(prefix KV) → ... → L0
+        #           ↑ prefix KV 有梯度 → Z_d → controller
         _t_base_fwd_start = _time.time()
-        with torch.no_grad():
-            inner_model = self.base_model.model
-            text_model = inner_model.language_model
-            lm_head = self.base_model.lm_head
 
-            # 3a. Embedding + 视觉融合
+        inner_model = self._inner_model
+        text_model = inner_model.language_model
+        lm_head = self._lm_head
+
+        # 3a. Embedding + 视觉融合 (no_grad: embedding 层冻结)
+        with torch.no_grad():
             inputs_embeds = inner_model.get_input_embeddings()(input_ids)
 
             if cached_visual_embeds is not None:
@@ -459,15 +707,16 @@ class RLDModel(nn.Module):
                     image_mask_3d = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
                     inputs_embeds = inputs_embeds.masked_scatter(image_mask_3d, image_embeds)
 
-            # 3b. 构建 visual_pos_masks (DeepStack 需要)
-            visual_pos_masks = None
-            deepstack_for_fwd = None
-            if pixel_values is not None and image_grid_thw is not None:
-                image_token_id = inner_model.config.image_token_id
-                visual_pos_masks = (input_ids == image_token_id)
-                deepstack_for_fwd = deepstack_features
+        # 3b. 构建 visual_pos_masks (DeepStack 需要)
+        visual_pos_masks = None
+        deepstack_for_fwd = None
+        if pixel_values is not None and image_grid_thw is not None:
+            image_token_id = inner_model.config.image_token_id
+            visual_pos_masks = (input_ids == image_token_id)
+            deepstack_for_fwd = deepstack_features
 
-            # 3c. 获取 mRoPE position_ids
+        # 3c. 获取 mRoPE position_ids (no_grad: 纯位置信息)
+        with torch.no_grad():
             seg_token_mask = torch.ones(B, seq_len, device=device, dtype=torch.long)
             inner_model.rope_deltas = None
             position_ids, rope_deltas = inner_model.get_rope_index(
@@ -483,109 +732,33 @@ class RLDModel(nn.Module):
                 text_pos = torch.arange(seq_len, device=device).unsqueeze(0).expand(B, -1)
                 position_ids = torch.cat([text_pos.unsqueeze(0), position_ids], dim=0)
 
-            # 3d. 手动展开 text_model forward, 收集最后层 hidden + 保存 rerun 入口点
-            # Top-K Rerun 方案: Pass 1 跑完全 36 层 (no_grad), 保存 rerun_start-1 层的输出
-            # Pass 2 将用有梯度的方式重算最后 K 层 + adapter 注入
-            cache_position = torch.arange(seq_len, device=device)
+        # 3d. 手动展开 text_model forward + prefix KV 注入
+        # Persistent Prefix Memory 方案:
+        # - 非注入层: 正常 forward (past_key_values=None)
+        # - 注入层: 构造 per-layer DynamicCache 预填充 prefix KV, 传入 decoder_layer
+        #   → self_attn 内部 past_key_values.update() 自动拼接 prefix KV 到 K/V 前面
+        #   → flash_attention_2 原生支持 KV_len > Q_len (标准 KV cache 用法)
+        #   → create_causal_mask 根据 cache 长度自动扩展 mask
+        N_p = self.num_prefix_slots  # prefix slots 数 (= K_d = 16)
 
-            # ---- 复现 Qwen3VLTextModel.forward() 的内部逻辑 ----
-            # (与原生实现严格一致, 参见 modeling_qwen3_vl.py Qwen3VLTextModel.forward)
+        cache_position = torch.arange(seq_len, device=device)
 
-            # position_ids 处理 (与原生一致)
-            _position_ids = position_ids
-            if _position_ids is not None and _position_ids.ndim == 3 and _position_ids.shape[0] == 4:
-                _text_position_ids = _position_ids[0]
-                _mrope_position_ids = _position_ids[1:]
-            elif _position_ids is not None:
-                _text_position_ids = _position_ids[0]
-                _mrope_position_ids = _position_ids
-            else:
-                _text_position_ids = cache_position.view(1, 1, -1).expand(3, B, -1)[0]
-                _mrope_position_ids = cache_position.view(1, 1, -1).expand(3, B, -1)
+        # position_ids 处理 (与原生一致)
+        _position_ids = position_ids
+        if _position_ids is not None and _position_ids.ndim == 3 and _position_ids.shape[0] == 4:
+            _text_position_ids = _position_ids[0]
+            _mrope_position_ids = _position_ids[1:]
+        elif _position_ids is not None:
+            _text_position_ids = _position_ids[0]
+            _mrope_position_ids = _position_ids
+        else:
+            _text_position_ids = cache_position.view(1, 1, -1).expand(3, B, -1)[0]
+            _mrope_position_ids = cache_position.view(1, 1, -1).expand(3, B, -1)
 
-            from transformers.masking_utils import create_causal_mask
-            _attention_mask = create_causal_mask(
-                config=text_model.config,
-                input_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                cache_position=cache_position,
-                past_key_values=None,
-                position_ids=_text_position_ids,
-            )
+        from transformers.masking_utils import create_causal_mask
+        from transformers.cache_utils import DynamicLayer as _DynamicLayer
 
-            hidden_states = inputs_embeds
-            position_embeddings = text_model.rotary_emb(hidden_states, _mrope_position_ids)
-
-            # 收集 all_hidden_states: 索引 0 = embedding 输出, 索引 i+1 = layer i 输出
-            all_hidden_states_list = [hidden_states]  # 索引 0: embedding 层输出
-
-            # Top-K Rerun: 保存 rerun 起点 (rerun_start 前一层的输出)
-            rerun_start = self.readout_adapter.rerun_start  # Phase 3: 28 (= 36 - 8)
-            rerun_entry_hidden = None  # 将在 layer rerun_start-1 (L27) 之后保存
-
-            for layer_idx, decoder_layer in enumerate(text_model.layers):
-                hidden_states = decoder_layer(
-                    hidden_states,
-                    attention_mask=_attention_mask,
-                    position_ids=_text_position_ids,
-                    past_key_values=None,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                )
-
-                # DeepStack: 与原生实现一致
-                if deepstack_for_fwd is not None and layer_idx in range(len(deepstack_for_fwd)):
-                    hidden_states = text_model._deepstack_process(
-                        hidden_states,
-                        visual_pos_masks,
-                        deepstack_for_fwd[layer_idx],
-                    )
-
-                # Top-K Rerun: 保存 rerun 起点
-                # rerun_start-1 层的输出就是 Pass 2 的输入
-                if layer_idx == rerun_start - 1:
-                    rerun_entry_hidden = hidden_states.clone()
-
-                # 收集 hidden states (保持索引对齐)
-                all_hidden_states_list.append(None)  # 占位
-
-            # 最终 norm (完整 36 层的结果, 用于 step summaries)
-            hidden_states = text_model.norm(hidden_states)
-            all_hidden_states_list.append(hidden_states)  # 索引 L+1: norm 后的输出
-
-            full_hidden = hidden_states  # [B, seq_len, hidden_size], 用于 step summaries
-            all_hidden_states = tuple(all_hidden_states_list)
-
-        _t_base_fwd_end = _time.time()
-
-        # ====== 显存监控: base forward 完成后 ======
-        if self._debug and device.type == 'cuda' and hasattr(self, '_mem_monitor_count') and (self._mem_monitor_count <= 2 or self._mem_monitor_count % 100 == 0):
-            _allocated = torch.cuda.memory_allocated(device) / 1024**3
-            _reserved = torch.cuda.memory_reserved(device) / 1024**3
-            _max_allocated = torch.cuda.max_memory_allocated(device) / 1024**3
-            print(f"📊 [rank {_rank}] base forward 完成后显存: "
-                  f"已分配={_allocated:.2f}GB, "
-                  f"已预留={_reserved:.2f}GB, "
-                  f"峰值={_max_allocated:.2f}GB",
-                  flush=True)
-
-        # ====== 调试: 验证 rerun 入口已保存 ======
-        if self._debug and (not hasattr(self, '_debug_collect_count') or self._debug_collect_count < 2):
-            if not hasattr(self, '_debug_collect_count'):
-                self._debug_collect_count = 0
-            self._debug_collect_count += 1
-            print("\n" + "=" * 70)
-            print(f"🔍 [RLDModel.forward] Top-K Rerun 入口验证 (#{self._debug_collect_count})")
-            print(f"   总层数: {self.total_layers}, rerun_k={self.rerun_k}, rerun_start=L{rerun_start}")
-            print(f"   注入层索引: {self.readout_adapter.injection_layer_indices}")
-            if rerun_entry_hidden is not None:
-                print(f"   ✅ rerun_entry_hidden (L{rerun_start-1}输出): shape={list(rerun_entry_hidden.shape)}, "
-                      f"norm={rerun_entry_hidden.detach().float().norm(dim=-1).mean().item():.4f}")
-            else:
-                print(f"   ❌ rerun_entry_hidden 为 None! rerun_start={rerun_start}")
-            print("=" * 70)
-
-        # ====== 4. 自动检测 step 边界 ======
+        # ====== 4. 自动检测 step 边界 (移到 forward 之前, chunkwise 需要) ======
         if prompt_lens is not None:
             gen_start = max(prompt_lens)
         else:
@@ -598,7 +771,6 @@ class RLDModel(nn.Module):
                 positions = [p for p in positions if p >= gen_start]
                 step_boundaries.append(positions)
 
-        # ====== 5. 统一 step boundaries 并按 step 切出 hidden → summaries ======
         # 收集所有 step 边界 (跨 batch 取并集，确保所有 rank 的循环次数一致)
         all_boundaries = set()
         if step_boundaries:
@@ -608,268 +780,557 @@ class RLDModel(nn.Module):
 
         per_sample_sets = [set(bl) for bl in step_boundaries] if step_boundaries else [set() for _ in range(B)]
 
-        # 限制最大 step 数 (保持合理的 controller scan 长度)
         MAX_STEPS = 14
         if len(split_points) > MAX_STEPS:
             split_points = split_points[:MAX_STEPS]
 
-        # 构建段: 每个段的 hidden 用于计算 step summary
-        segments = []
-        prev = gen_start
-        for sp in split_points:
-            segments.append((prev, sp + 1))
-            prev = sp + 1
-        # 最后一段不需要作为 step (它之后没有需要更新的内容)
+        # ====== 构建 chunks: 按 step boundary 切分序列 ======
+        # chunk_ranges: [(start, end), ...], 每个 chunk 的 token 范围 [start, end)
+        # 第一个 chunk: [0, first_boundary+1)
+        # 中间 chunks: [prev_boundary+1, boundary+1)
+        # 最后一个 chunk: [last_boundary+1, seq_len)
+        chunk_ranges = []
+        if len(split_points) == 0:
+            # 无 step boundary: 整个序列作为一个 chunk
+            chunk_ranges.append((0, seq_len))
+        else:
+            # 第一个 chunk: 从序列开头到第一个 boundary (含)
+            chunk_ranges.append((0, split_points[0] + 1))
+            # 中间 chunks
+            for i in range(1, len(split_points)):
+                chunk_ranges.append((split_points[i - 1] + 1, split_points[i] + 1))
+            # 最后一个 chunk: 从最后一个 boundary 之后到序列末尾
+            if split_points[-1] + 1 < seq_len:
+                chunk_ranges.append((split_points[-1] + 1, seq_len))
 
-        # 为每个 step 计算 summary S_c 和 update_mask
+        injection_set = set(self.injection_layer_indices)
+
+        # ====== Full KV Cache Chunkwise Training (训推一致) ======
+        # 核心改进: 训练时维护完整 KV cache, 让每个 chunk 的 token 能看到所有历史 token
+        # 与推理时完全一致: prefix KV + 完整历史 KV cache
+        #
+        # KV cache 管理策略:
+        # - KV cache 本身 detach (不参与梯度计算, 只提供历史上下文)
+        # - 只有 prefix KV 有梯度 (通过 PrefixKVProjector → Z_d → controller)
+        # - 每个 chunk 的 36 层 forward 有梯度 (当前 chunk 的 token 有梯度)
+        #
+        # KV cache 布局 (注入层):
+        #   [prefix_KV(0~N_p-1)] [历史 token KV (detach)] [当前 chunk KV (有梯度)]
+        # KV cache 布局 (非注入层):
+        #   [历史 token KV (detach)] [当前 chunk KV (有梯度)]
+        #
+        # 梯度路径 (方案 B):
+        #   CE loss → logits → chunk_c hidden → L35(prefix_KV_c) → prefix_source → G_c → controller
+        #   prefix_source = gate * G_c + (1 - gate) * Z_d_init
+
+        # ====== 将 prefill 输出 cast 到基座 dtype ======
+        # controller.prefill 内部使用 controller 参数 dtype (可能是 float32),
+        # 但 Z_d 需要传入 prefix_kv_projector → 基座模型, 必须是 bfloat16
+        Z_d_current = rld_state['Z_d'].to(_base_dtype)  # [B, K_d, d_z], cast 到基座 dtype
+        Z_d_init = rld_state['Z_d_init'].to(_base_dtype)  # [B, K_d, d_z], 固定视觉基线
+        # 同步更新 rld_state 中的引用 (后续代码可能直接读取)
+        rld_state['Z_d'] = Z_d_current
+        rld_state['Z_d_init'] = Z_d_init
+        if rld_state.get('visual_hidden_proj') is not None:
+            rld_state['visual_hidden_proj'] = rld_state['visual_hidden_proj'].to(_base_dtype)
+        all_Z_d = [Z_d_current]  # 收集所有 step 的 prefix_source (含初始)
+        all_T_c = []  # 收集每步的 T_c (备用, 对比学习已弃用)
+        all_commit_scores = []  # 收集每步的 commit_score (用于 commit loss, 正样本)
+        all_neg_commit_scores = []  # 收集非 boundary 位置的 commit_score (负样本)
+        _per_step_ranks = []  # 收集每步 Z_d 的有效秩 (秩演化追踪)
         step_summaries = []
         update_masks = []
-
-        for seg_idx, (seg_start, seg_end) in enumerate(segments):
-            sp = split_points[seg_idx]
-
-            # 累积 hidden: 从序列起始到当前 step 边界
-            # 简化版: 只取当前段的 hidden (与旧版 per_sample_hidden_buffers 等价)
-            seg_hidden = full_hidden[:, seg_start:seg_end, :]  # [B, seg_len, hidden_size]
-
-            # StepResampler: seg_hidden → S_c
-            S_c = self.controller.step_resampler(seg_hidden)  # [B, K_t, d_z]
-            step_summaries.append(S_c)
-
-            # Per-sample update mask
-            mask = torch.tensor(
-                [sp in per_sample_sets[b] for b in range(B)],
-                dtype=torch.bool, device=device,
-            )
-            update_masks.append(mask)
-
-        # ====== 6. Recurrent controller scan ======
+        all_chunk_hidden = []  # 收集每个 chunk 的 normed hidden (用于最终 logits)
         div_loss = torch.tensor(0.0, device=device, dtype=ctrl_dtype)
+        grounding_loss = torch.tensor(0.0, device=device, dtype=ctrl_dtype)  # Visual Grounding Loss
 
-        if len(step_summaries) > 0:
-            final_state, all_Z_d = self.controller.scan_steps(
-                rld_state, step_summaries, update_masks
+        position_embeddings = text_model.rotary_emb(inputs_embeds, _mrope_position_ids)
+
+        # ====== 初始化 per-layer KV cache (detach, 只提供历史上下文) ======
+        # 使用 list of (K, V) per layer, 比 DynamicCache 更灵活
+        # 注入层: 额外包含 prefix KV 在头部
+        # 非注入层: 只有历史 token KV
+        # 初始状态: 所有层的 KV cache 为空 (None)
+        _layer_kv_cache = [None] * self.total_layers  # list of (K, V) or None
+
+        for chunk_idx, (chunk_start, chunk_end) in enumerate(chunk_ranges):
+            chunk_len = chunk_end - chunk_start
+
+            # ---- 当前 chunk 的输入切片 ----
+            chunk_embeds = inputs_embeds[:, chunk_start:chunk_end, :]  # [B, chunk_len, H]
+            chunk_attn_mask_raw = attention_mask[:, :chunk_end] if attention_mask.dim() == 2 else attention_mask
+            chunk_cache_position = cache_position[chunk_start:chunk_end]  # [chunk_len]
+            chunk_text_pos = _text_position_ids[:, chunk_start:chunk_end] if _text_position_ids.dim() == 2 else _text_position_ids
+            chunk_mrope_pos = _mrope_position_ids[:, :, chunk_start:chunk_end]
+
+            # 重新计算 chunk 的 position embeddings (RoPE 依赖位置)
+            chunk_pos_emb = text_model.rotary_emb(chunk_embeds, chunk_mrope_pos)
+
+            # ---- 计算当前 Z_d 的 prefix KV (有梯度) ----
+            # 确保 Z_d_current 是基座 dtype (bfloat16), 防止 Accelerate upcast 导致的 dtype 传播
+            if Z_d_current.dtype != _base_dtype:
+                Z_d_current = Z_d_current.to(_base_dtype)
+            prefix_kvs = self.prefix_kv_projector.get_all_prefix_kvs(Z_d_current)
+
+            # ====== DEBUG: prefix KV dtype 检查 ======
+            if _rank == 0 and self._fwd_count <= 2 and chunk_idx == 0:
+                print(f"\n🔍 [DEBUG prefix KV] chunk_idx={chunk_idx}:", flush=True)
+                print(f"  Z_d_current: dtype={Z_d_current.dtype}", flush=True)
+                print(f"  chunk_embeds: dtype={chunk_embeds.dtype}", flush=True)
+                for _li, (_pk, _pv) in prefix_kvs.items():
+                    print(f"  prefix_kvs[{_li}]: K.dtype={_pk.dtype}, V.dtype={_pv.dtype}", flush=True)
+                    break  # 只打印第一个注入层
+
+            # ---- 36 层 forward (有梯度, 使用完整 KV cache + prefix KV) ----
+            hidden_states = chunk_embeds
+            for layer_idx, decoder_layer in enumerate(text_model.layers):
+                # 构造当前层的 past_key_values (DynamicCache 格式)
+                layer_cache = DynamicCache()
+                _history_kv_len = 0  # 历史 KV 长度 (不含 prefix)
+
+                if layer_idx in injection_set:
+                    # 注入层: [prefix_KV] + [历史 KV (detach)]
+                    pfx_k, pfx_v = prefix_kvs[layer_idx]  # 有梯度
+                    # 构造 DynamicCache: 先填充前面的空层, 再填充当前层
+                    for i in range(layer_idx + 1):
+                        dl = _DynamicLayer()
+                        if i == layer_idx:
+                            if _layer_kv_cache[layer_idx] is not None:
+                                # 拼接: [prefix_KV; 历史 KV (detach)]
+                                hist_k, hist_v = _layer_kv_cache[layer_idx]
+                                _history_kv_len = hist_k.shape[2]
+                                dl.keys = torch.cat([pfx_k, hist_k], dim=2)    # [B, H, N_p+hist_len, D]
+                                dl.values = torch.cat([pfx_v, hist_v], dim=2)  # [B, H, N_p+hist_len, D]
+                            else:
+                                # 第一个 chunk: 只有 prefix KV
+                                dl.keys = pfx_k
+                                dl.values = pfx_v
+                            dl.is_initialized = True
+                        layer_cache.layers.append(dl)
+
+                    # cache_position: 当前 chunk 的位置从 N_p + history_len 开始
+                    _layer_cache_pos = chunk_cache_position + N_p
+                    # attention_mask: 需要覆盖 [prefix + 历史 + 当前 chunk] 的完整范围
+                    _total_past_len = N_p + _history_kv_len
+                    _layer_attn_mask_raw = torch.ones(B, _total_past_len + chunk_len, device=device, dtype=attention_mask.dtype)
+                    # 将历史部分的 attention mask 正确填充
+                    if _history_kv_len > 0:
+                        _layer_attn_mask_raw[:, N_p:N_p + _history_kv_len] = attention_mask[:, :_history_kv_len] if attention_mask.dim() == 2 else 1
+                    # 当前 chunk 部分
+                    if attention_mask.dim() == 2:
+                        _layer_attn_mask_raw[:, _total_past_len:] = attention_mask[:, chunk_start:chunk_end]
+
+                    _layer_attn_mask = create_causal_mask(
+                        config=text_model.config,
+                        input_embeds=chunk_embeds,
+                        attention_mask=_layer_attn_mask_raw,
+                        cache_position=_layer_cache_pos,
+                        past_key_values=layer_cache,
+                        position_ids=chunk_text_pos,
+                    )
+
+                    # ====== DEBUG: decoder layer 输入 dtype ======
+                    if _rank == 0 and self._fwd_count <= 2 and chunk_idx == 0 and layer_idx == self.injection_layer_indices[0]:
+                        print(f"\n🔍 [DEBUG decoder_layer] layer_idx={layer_idx}, chunk_idx={chunk_idx}:", flush=True)
+                        print(f"  hidden_states: dtype={hidden_states.dtype}", flush=True)
+                        print(f"  _layer_attn_mask: dtype={_layer_attn_mask.dtype if _layer_attn_mask is not None else 'None'}", flush=True)
+                        _dl_k = layer_cache.layers[layer_idx].keys
+                        _dl_v = layer_cache.layers[layer_idx].values
+                        print(f"  layer_cache K: dtype={_dl_k.dtype}, V: dtype={_dl_v.dtype}", flush=True)
+
+                    hidden_states = decoder_layer(
+                        hidden_states,
+                        attention_mask=_layer_attn_mask,
+                        position_ids=chunk_text_pos,
+                        past_key_values=layer_cache,
+                        cache_position=_layer_cache_pos,
+                        position_embeddings=chunk_pos_emb,
+                    )
+                else:
+                    # 非注入层: [历史 KV (detach)] (无 prefix)
+                    if _layer_kv_cache[layer_idx] is not None:
+                        hist_k, hist_v = _layer_kv_cache[layer_idx]
+                        _history_kv_len = hist_k.shape[2]
+                        for i in range(layer_idx + 1):
+                            dl = _DynamicLayer()
+                            if i == layer_idx:
+                                dl.keys = hist_k
+                                dl.values = hist_v
+                                dl.is_initialized = True
+                            layer_cache.layers.append(dl)
+
+                        _layer_attn_mask_raw = torch.ones(B, _history_kv_len + chunk_len, device=device, dtype=attention_mask.dtype)
+                        if attention_mask.dim() == 2:
+                            _layer_attn_mask_raw[:, :_history_kv_len] = attention_mask[:, :_history_kv_len]
+                            _layer_attn_mask_raw[:, _history_kv_len:] = attention_mask[:, chunk_start:chunk_end]
+
+                        _layer_attn_mask = create_causal_mask(
+                            config=text_model.config,
+                            input_embeds=chunk_embeds,
+                            attention_mask=_layer_attn_mask_raw,
+                            cache_position=chunk_cache_position,
+                            past_key_values=layer_cache,
+                            position_ids=chunk_text_pos,
+                        )
+
+                        hidden_states = decoder_layer(
+                            hidden_states,
+                            attention_mask=_layer_attn_mask,
+                            position_ids=chunk_text_pos,
+                            past_key_values=layer_cache,
+                            cache_position=chunk_cache_position,
+                            position_embeddings=chunk_pos_emb,
+                        )
+                    else:
+                        # 第一个 chunk 的非注入层: 无历史 KV
+                        # 传入空 DynamicCache 以收集当前 chunk 的 KV (供后续 chunk 使用)
+                        for i in range(layer_idx + 1):
+                            dl = _DynamicLayer()
+                            layer_cache.layers.append(dl)
+
+                        _layer_attn_mask = create_causal_mask(
+                            config=text_model.config,
+                            input_embeds=chunk_embeds,
+                            attention_mask=attention_mask[:, chunk_start:chunk_end] if attention_mask.dim() == 2 else attention_mask,
+                            cache_position=chunk_cache_position,
+                            past_key_values=None,  # 第一个 chunk 无历史, 但 layer_cache 用于收集新 KV
+                            position_ids=chunk_text_pos,
+                        )
+                        hidden_states = decoder_layer(
+                            hidden_states,
+                            attention_mask=_layer_attn_mask,
+                            position_ids=chunk_text_pos,
+                            past_key_values=layer_cache,  # 传入空 cache, decoder_layer 会写入新 KV
+                            cache_position=chunk_cache_position,
+                            position_embeddings=chunk_pos_emb,
+                        )
+
+                # ---- 更新 KV cache: 从 layer_cache 中提取当前 chunk 产生的 KV, 追加到历史 ----
+                # decoder_layer 内部的 self_attn 会调用 past_key_values.update() 将新 KV 追加
+                # 我们需要提取追加后的完整 KV, 然后 detach 保存
+                if layer_cache.layers and len(layer_cache.layers) > layer_idx:
+                    _updated_layer = layer_cache.layers[layer_idx]
+                    if hasattr(_updated_layer, 'keys') and _updated_layer.keys is not None:
+                        _full_k = _updated_layer.keys.detach()   # [B, H, total_len, D]
+                        _full_v = _updated_layer.values.detach()  # [B, H, total_len, D]
+                        if layer_idx in injection_set:
+                            # 注入层: 去掉 prefix 部分, 只保留真实 token 的 KV
+                            _layer_kv_cache[layer_idx] = (_full_k[:, :, N_p:, :], _full_v[:, :, N_p:, :])
+                        else:
+                            _layer_kv_cache[layer_idx] = (_full_k, _full_v)
+
+                # DeepStack: 与原生实现一致
+                if deepstack_for_fwd is not None and layer_idx in range(len(deepstack_for_fwd)):
+                    if visual_pos_masks is not None:
+                        chunk_visual_pos = visual_pos_masks[:, chunk_start:chunk_end]
+                        if chunk_visual_pos.any():
+                            full_visual_pos = visual_pos_masks
+                            pre_chunk_visual_count = full_visual_pos[:, :chunk_start].sum().item()
+                            chunk_visual_count = chunk_visual_pos.sum().item()
+                            if chunk_visual_count > 0:
+                                chunk_visual_embeds = deepstack_for_fwd[layer_idx][pre_chunk_visual_count:pre_chunk_visual_count + chunk_visual_count]
+                                hidden_states = text_model._deepstack_process(
+                                    hidden_states,
+                                    chunk_visual_pos,
+                                    chunk_visual_embeds,
+                                )
+
+            # 最终 norm (有梯度)
+            chunk_normed = text_model.norm(hidden_states)
+            all_chunk_hidden.append(chunk_normed)
+
+            # ---- 如果不是最后一个 chunk, 提取 step summary 并更新 Z_d ----
+            is_boundary_chunk = (chunk_idx < len(chunk_ranges) - 1) or (
+                len(split_points) > 0 and chunk_end - 1 == split_points[-1]
             )
-            # 每个 step 的 diversity loss (同时惩罚 Z_d 和 Z_e 的坍塌)
-            Z_e_for_div = rld_state['Z_e']  # Z_e 不随 step 变化
-            for Z_d_c in all_Z_d[1:]:  # 跳过 Z_d_0
-                tmp_state = {'Z_d': Z_d_c, 'Z_e': Z_e_for_div}
-                div_loss = div_loss + self.controller.compute_diversity_loss(tmp_state)
-            div_loss = div_loss / max(len(all_Z_d) - 1, 1)
-            rld_state = final_state
-        else:
-            all_Z_d = [rld_state['Z_d']]
+            chunk_end_token = chunk_end - 1
+            is_at_boundary = chunk_end_token in set(split_points)
 
-        # ====== 7. 将 step-level Z_d 展开到 token 级 ======
-        # 每个 token 使用其所属 step 的 draft state
-        # Z_d_expanded: [B, seq_len, K_d, d_z]
-        K_d = all_Z_d[0].shape[1]
+            if is_at_boundary:
+                # 提取当前 chunk 中 gen_start 之后的 hidden 作为 step summary 输入
+                seg_start_in_chunk = max(0, gen_start - chunk_start)
+                seg_hidden = chunk_normed[:, seg_start_in_chunk:, :]  # [B, seg_len, H]
 
-        # 建立 token → step 映射
-        # step_indices[t] = 哪个 Z_d (0 = Z_d_0, 1 = Z_d_1, ...)
-        step_indices = torch.zeros(seq_len, dtype=torch.long, device=device)
-        for seg_idx, sp in enumerate(split_points):
-            # sp 之后的 token 使用 Z_d_{seg_idx+1}
-            if sp + 1 < seq_len:
-                step_indices[sp + 1:] = seg_idx + 1
+                # StepResampler: seg_hidden → S_c
+                S_c = self.controller.step_resampler(seg_hidden)  # [B, K_t, d_z]
+                step_summaries.append(S_c)
 
-        # 堆叠所有 Z_d: [C+1, B, K_d, d_z]
-        Z_d_stack = torch.stack(all_Z_d, dim=0)  # [C+1, B, K_d, d_z]
-
-        # 按 step_indices 展开: [seq_len] → index into [C+1, ...]
-        # Z_d_expanded: [B, seq_len, K_d, d_z]
-        Z_d_expanded = Z_d_stack[step_indices]  # [seq_len, B, K_d, d_z]
-        Z_d_expanded = Z_d_expanded.permute(1, 0, 2, 3)  # [B, seq_len, K_d, d_z]
-
-        # ====== 8. Pass 2: Top-K Rerun — 有梯度重算最后 K 层 + in-situ adapter 注入 ======
-        # 核心思想: 从 rerun_entry_hidden (L{rerun_start-1}的输出) 出发,
-        # 重新跑最后 K 层 decoder layer, 在注入点插入 adapter。
-        # 修正后的 hidden 继续参与后续层的 self-attention → 真正的因果一致性。
-        #
-        # Pass 2 的梯度路径: loss → lm_head → norm → rerun layers → adapter → Z_d → controller
-        # 冻结层的参数 requires_grad=False, 但 hidden states 有梯度 (从 adapter 注入)。
-        _t_pass2_start = _time.time()
-
-        # ====== 源头选择性注入: 在 Pass 2 rerun 之前计算 token 级置信度权重 ======
-        # 核心思想: 基座模型已经很确定的 token 不需要 draft 修正,
-        # 在 adapter 注入层就直接做 token 级加权, 而非事后衰减。
-        # 这样 KV cache 中也不会包含不必要的修正信息。
-        _inject_weight = None  # [B, seq_len, 1] 或 None
-        if self.selective_injection and labels is not None:
-            with torch.no_grad():
-                # 基座模型原始 logits (用于计算置信度)
-                _base_logits_for_conf = lm_head(full_hidden)  # [B, seq_len, V]
-                base_probs = F.softmax(_base_logits_for_conf, dim=-1)
-                # 基座 top-1 概率: 越高说明越确定, 越不需要修正
-                base_confidence = base_probs.max(dim=-1).values  # [B, seq_len]
-                # 注入权重: 基座越不确定 → 权重越大 (1.0), 基座很确定 → 权重趋近 0
-                # min=0.05: 即使基座 100% 确定, 也保留 5% 的微弱注入 (防止完全断开梯度)
-                _inject_weight = (1.0 - base_confidence).clamp(min=0.05).unsqueeze(-1)  # [B, seq_len, 1]
-                del base_probs  # 立即释放显存
-                # 注意: _base_logits_for_conf 保留, 供后续 KL 散度复用
-
-        # 从 rerun 入口点出发, detach 切断与 Pass 1 的梯度连接
-        rerun_hidden = rerun_entry_hidden.detach()
-
-        # 注意: position_embeddings, _attention_mask, _text_position_ids, cache_position
-        # 都是在 no_grad 块中定义的局部变量, 它们不需要梯度 (纯位置信息)
-        for layer_idx in range(rerun_start, self.total_layers):
-            decoder_layer = text_model.layers[layer_idx]
-            # 冻结层 forward: 参数 requires_grad=False, 但输入 hidden 有梯度
-            # → 输出 hidden 有梯度 (因为是 hidden 的函数)
-            rerun_hidden = decoder_layer(
-                rerun_hidden,
-                attention_mask=_attention_mask,
-                position_ids=_text_position_ids,
-                past_key_values=None,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-            )
-
-            # DeepStack: 通常不会触发 (DeepStack 只影响前几层)
-            if deepstack_for_fwd is not None and layer_idx in range(len(deepstack_for_fwd)):
-                rerun_hidden = text_model._deepstack_process(
-                    rerun_hidden,
-                    visual_pos_masks,
-                    deepstack_for_fwd[layer_idx],
+                # Per-sample update mask
+                mask = torch.tensor(
+                    [chunk_end_token in per_sample_sets[b] for b in range(B)],
+                    dtype=torch.bool, device=device,
                 )
+                update_masks.append(mask)
 
-            # ★ In-situ adapter 注入 (源头选择性): inject_weight 在 adapter 内部直接加权修正量
-            # 基座确定的 token → 修正量被压缩 → KV 中几乎不含 draft 信息
-            # 基座不确定的 token → 修正量充分保留 → draft 在关键位置发力
-            rerun_hidden = self.readout_adapter.inject(
-                layer_idx, rerun_hidden, Z_d_expanded, inject_weight=_inject_weight
-            )
+                # ---- Controller update: S_c → T_c → LatentDraftFlow → Z_d_new ----
+                T_prev = rld_state['T']
+                visual_hidden_proj = rld_state.get('visual_hidden_proj')
 
-        # 最终 norm (有梯度)
-        adapted_hidden = text_model.norm(rerun_hidden)
+                if self.controller.use_trace_updater:
+                    T_c = self.controller.trace_ema(T_prev, S_c)
+                    flow_query = T_c
+                else:
+                    T_c = S_c
+                    flow_query = S_c
 
-        # ====== 基座 logits 缓存 (供 KL 散度复用) ======
-        _cached_base_logits = None
-        if self.lambda_kl > 0 and labels is not None:
-            if self.selective_injection and _inject_weight is not None:
-                # 复用选择性注入阶段已计算的基座 logits (避免重复 lm_head 计算)
-                _cached_base_logits = _base_logits_for_conf
-            else:
+                # 收集 T_c (用于 contrastive learning)
+                all_T_c.append(T_c)
+
+                # 计算 commit_score (训练时用于 commit loss 监督)
+                S_prev = rld_state.get('_last_S_c', torch.zeros_like(S_c))
+                commit_score_val = self.controller.commit_gate(S_running=S_c, S_prev=S_prev, Z_d=Z_d_current)
+                all_commit_scores.append(commit_score_val)
+
+                # ---- 负样本: 从当前 boundary chunk 的前半段采样 ----
+                _neg_seg_len = seg_hidden.shape[1]
+                if _neg_seg_len >= 4:
+                    _neg_half = max(2, _neg_seg_len // 2)
+                    seg_hidden_neg_intra = chunk_normed[:, seg_start_in_chunk:seg_start_in_chunk + _neg_half, :]
+                    with torch.no_grad():
+                        S_neg_intra = self.controller.step_resampler(seg_hidden_neg_intra)
+                    neg_commit_score_intra = self.controller.commit_gate(
+                        S_running=S_neg_intra.detach(), S_prev=S_prev.detach(), Z_d=Z_d_current.detach()
+                    )
+                    all_neg_commit_scores.append(neg_commit_score_intra)
+
+                # 方案 D: Latent Draft Flow (隐空间流)
+                if visual_hidden_proj is not None:
+                    prefix_source_new = self.controller.compute_prefix_source(
+                        S_c=flow_query,
+                        Z_d_prev=Z_d_current,
+                        visual_hidden=visual_hidden_proj,
+                    )
+                else:
+                    prefix_source_new = self.controller.compute_prefix_source(
+                        S_c=flow_query,
+                        Z_d_prev=Z_d_current,
+                        visual_hidden=rld_state['Z_e'],
+                    )
+
+                # Per-sample 选择性更新
+                if mask is not None:
+                    float_mask = mask.to(dtype=Z_d_current.dtype).unsqueeze(-1).unsqueeze(-1)
+                    prefix_source_new = float_mask * prefix_source_new + (1.0 - float_mask) * Z_d_current
+                    T_c = float_mask * T_c + (1.0 - float_mask) * T_prev
+
+                # 更新 rld_state
+                rld_state = {
+                    'Z_e': rld_state['Z_e'],  # 透传
+                    'visual_hidden_proj': visual_hidden_proj,  # 透传
+                    'Z_d_init': Z_d_init,                      # 透传
+                    'Z_d': prefix_source_new,                  # 方案 D: latent draft flow 输出
+                    'T': T_c,
+                    'step_count': rld_state['step_count'] + 1,
+                    '_last_S_c': S_c.detach(),
+                }
+
+                # 收集 per-step 秩指标 (轻量, 只在 detach 后计算)
                 with torch.no_grad():
-                    _cached_base_logits = lm_head(full_hidden)  # [B, seq_len, V]
+                    _per_step_ranks.append({
+                        'Zd_rank': self.controller._effective_rank(prefix_source_new.detach()),
+                        'Zd_cosim': self.controller._slot_cosine_similarity(prefix_source_new.detach()),
+                        'T_rank': self.controller._effective_rank(T_c.detach()),
+                        'Zd_norm': prefix_source_new.detach().norm(dim=-1).mean().item(),
+                    })
 
-        _t_pass2_end = _time.time()
+                # Diversity loss (Z_d + S_c)
+                tmp_state = {'Z_d': prefix_source_new, 'Z_e': rld_state['Z_e']}
+                div_loss = div_loss + self.controller.compute_diversity_loss(tmp_state)
+                # S_c diversity loss: 鼓励 step_queries 的 16 个 slot 输出分化
+                # S_c 有效秩 ~1.4 说明 slot 严重坍塌, 需要直接正则化
+                div_loss = div_loss + self.controller.diversity_reg(S_c) * self.controller.lambda_div
 
-        # ====== 调试: Pass 2 注入前后 hidden 对比 (证明 draft 影响了 CoT) ======
-        # ⚠️ 仅在 RLD_DEBUG=1 时执行, 包含额外 lm_head 计算, 会导致 rank 0 显著变慢
+                # 更新 Z_d_current 为新的 prefix_source (下一个 chunk 使用)
+                # 显式 cast 到基座 dtype: controller 输出可能是 float32 (Accelerate upcast),
+                # 但 Z_d_current 需要传入 prefix_kv_projector → 基座模型, 必须是 bfloat16
+                Z_d_current = prefix_source_new.to(_base_dtype)
+                all_Z_d.append(Z_d_current)
+
+                # ---- 更新注入层 KV cache 中的 prefix KV (覆写, 与推理时一致) ----
+                # Z_d 更新后, 重新投影 prefix KV, 后续 chunk 的 attention 自然看到新 prefix
+                # 注意: 这里不需要显式覆写, 因为每个 chunk 开头都会重新计算 prefix_kvs
+                # 但 _layer_kv_cache 中存储的是不含 prefix 的历史 KV, prefix 在每次循环开头拼接
+
+            else:
+                # ---- 非 boundary chunk (Answer 区域): 计算 commit_score 作为负样本 (来源 2) ----
+                # 负样本来源 1: 每个 boundary chunk 的前半段 (step 内部中间位置, 在上面 is_at_boundary 分支中采样)
+                # 负样本来源 2: Answer 区域 (推理已结束, 不该再 commit)
+                if len(step_summaries) > 0 and chunk_end > gen_start:
+                    seg_start_in_chunk = max(0, gen_start - chunk_start)
+                    seg_hidden_neg = chunk_normed[:, seg_start_in_chunk:, :]  # [B, seg_len, H]
+                    if seg_hidden_neg.shape[1] > 0:
+                        with torch.no_grad():
+                            S_neg = self.controller.step_resampler(seg_hidden_neg)  # [B, K_t, d_z]
+                        S_prev_neg = rld_state.get('_last_S_c', torch.zeros_like(S_neg))
+                        neg_commit_score = self.controller.commit_gate(
+                            S_running=S_neg.detach(), S_prev=S_prev_neg, Z_d=Z_d_current.detach()  # 方案 B: Z_d_current 是 prefix_source
+                        )
+                        all_neg_commit_scores.append(neg_commit_score)
+
+        # 释放 KV cache 显存
+        del _layer_kv_cache
+
+        # 归一化 diversity loss 和 grounding loss
+        if len(all_Z_d) > 1:
+            div_loss = div_loss / max(len(all_Z_d) - 1, 1)
+            grounding_loss = grounding_loss / max(len(all_Z_d) - 1, 1)
+
+        # ====== Concat 所有 chunk 的 hidden → 完整序列 ======
+        if len(all_chunk_hidden) == 1:
+            adapted_hidden = all_chunk_hidden[0]
+        else:
+            adapted_hidden = torch.cat(all_chunk_hidden, dim=1)  # [B, seq_len, H]
+        full_hidden = adapted_hidden
+
+        # 保存 chunkwise 循环中收集的中间结果到 rld_state
+        rld_state['_all_T_c'] = all_T_c
+        rld_state['_all_commit_scores'] = all_commit_scores
+        rld_state['_all_neg_commit_scores'] = all_neg_commit_scores
+
+        _t_base_fwd_end = _time.time()
+
+        # ====== 显存监控: chunkwise forward 完成后 ======
+        if self._debug and device.type == 'cuda' and hasattr(self, '_mem_monitor_count') and (self._mem_monitor_count <= 2 or self._mem_monitor_count % 100 == 0):
+            _allocated = torch.cuda.memory_allocated(device) / 1024**3
+            _reserved = torch.cuda.memory_reserved(device) / 1024**3
+            _max_allocated = torch.cuda.max_memory_allocated(device) / 1024**3
+            print(f"📊 [rank {_rank}] chunkwise forward 完成后显存: "
+                  f"已分配={_allocated:.2f}GB, "
+                  f"已预留={_reserved:.2f}GB, "
+                  f"峰值={_max_allocated:.2f}GB, "
+                  f"chunks={len(chunk_ranges)}, steps={len(split_points)}",
+                  flush=True)
+
+        # ====== 6b. Contrastive Draft Learning: 已弃用 (当前数据无 wrong_cot + correct_cot 配对) ======
+
+        # ====== 7. [Chunkwise Prefix KV] 训推一致: 每个 chunk 使用对应 Z_d 的 prefix KV ======
+        # 已在上面的 chunkwise forward 循环中实现:
+        # - 每个 chunk 使用当前 Z_d_c 的 prefix KV 做 36 层 forward
+        # - chunk 边界处: step summary → controller update → Z_d_{c+1} → 新 prefix KV
+        # - 下一个 chunk 使用新的 prefix KV
+        # 梯度路径: CE loss → logits → chunk_c hidden → prefix_KV_c → Z_d_c → controller
+        # 每个 Z_d_c 都有来自 CE loss 的直接梯度 (训推一致)
+
+        # ====== 调试: Prefix KV 注入效果验证 ======
         if self._debug and (not hasattr(self, '_debug_inject_count') or self._debug_inject_count < 1):
             if not hasattr(self, '_debug_inject_count'):
                 self._debug_inject_count = 0
             self._debug_inject_count += 1
             with torch.no_grad():
-                _diff = (adapted_hidden - full_hidden.to(adapted_hidden.dtype)).float()
-                _diff_norm = _diff.norm(dim=-1)  # [B, seq_len]
-                _orig_norm = full_hidden.float().norm(dim=-1)  # [B, seq_len]
-
-                # 对比注入前后的 logits (取前 50 个 token 采样, 减少开销)
-                _sample_len = min(50, seq_len)
-                _logits_original = self.base_model.lm_head(full_hidden[:, :_sample_len, :])  # [B, sample, V]
-                _logits_adapted = self.base_model.lm_head(adapted_hidden[:, :_sample_len, :])  # [B, sample, V]
-                _logit_diff = (_logits_adapted - _logits_original).float().abs().mean().item()
-
-                # top-1 token 变化率
-                _top1_orig = _logits_original.argmax(dim=-1)  # [B, sample]
-                _top1_adapt = _logits_adapted.argmax(dim=-1)  # [B, sample]
-                _top1_changed = (_top1_orig != _top1_adapt).float().mean().item()
-
-                # 立即释放大 tensor
-                del _logits_original, _logits_adapted
-
                 print("\n" + "=" * 70)
-                print(f"🎯 [RLDModel.forward] Top-K Rerun Draft 注入效果验证 (#{self._debug_inject_count})")
+                print(f"🎯 [RLDModel.forward] Prefix KV 注入效果验证 (#{self._debug_inject_count})")
                 print(f"   序列长度: {seq_len}, Step 数: {len(split_points)}, Z_d 版本数: {len(all_Z_d)}")
-                print(f"   Rerun K={self.rerun_k}, 注入层: {self.readout_adapter.injection_layer_indices}")
-                print(f"   Pass 2 耗时: {_t_pass2_end - _t_pass2_start:.2f}s")
-                print(f"   ── Hidden 修正量 ──")
-                print(f"   修正量 L2 范数 (全序列均值): {_diff_norm.mean().item():.6f}")
-                print(f"   修正量 L2 范数 (最大值):     {_diff_norm.max().item():.6f}")
-                print(f"   原始 hidden L2 范数均值:      {_orig_norm.mean().item():.4f}")
-                print(f"   修正/原始比:                  {_diff_norm.mean().item() / max(_orig_norm.mean().item(), 1e-8):.6f}")
-                print(f"   ── Logits 影响 ──")
-                print(f"   Logit 绝对差均值 (前{_sample_len}token): {_logit_diff:.6f}")
-                print(f"   Top-1 token 变化率:           {_top1_changed*100:.1f}%")
-                if _diff_norm.mean().item() > 1e-8:
-                    print(f"   ✅ Top-K Rerun Draft 注入正在影响 CoT: hidden 被修正, logits 已改变")
-                else:
-                    print(f"   ⚠️ Draft 注入量极小, 可能尚未学到有效修正")
+                print(f"   注入层: {self.injection_layer_indices}")
+                print(f"   Prefix slots: {N_p}")
                 print("=" * 70)
 
         # ====== 9. 计算 logits ======
-        lm_head = self.base_model.lm_head
+        lm_head = self._lm_head
         logits = lm_head(adapted_hidden)  # [B, seq_len, V]
 
         # ====== 10. 计算 loss ======
         total_loss = torch.tensor(0.0, device=device, dtype=ctrl_dtype)
         main_loss = torch.tensor(0.0, device=device, dtype=ctrl_dtype)
-        kl_loss = torch.tensor(0.0, device=device, dtype=ctrl_dtype)
 
         if labels is not None:
             # 标准 next-token prediction: shift logits 和 labels
-            shift_logits = logits[:, :-1, :].contiguous()
+            shift_logits = logits[:, :-1, :].contiguous().float()  # 显式 upcast 到 float32, 确保 backward 时 ToCopyBackward 将梯度转回 bfloat16
             shift_labels = labels[:, 1:].contiguous()
 
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            ce_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            # ====== P2: 加权 CE loss — answer token 获得更高权重 ======
+            # 当 answer 很短 (如单字符 "B") 时, 有效监督 token 极少 (~2 个),
+            # 而 think 块可能有 ~300 个有效 token, 导致 answer 的梯度信号被淹没。
+            # loss_weight_mask 对 answer token 赋予更高权重, 使其梯度贡献与 think 块等量。
+            if loss_weight_mask is not None:
+                # shift weight mask 与 shift_labels 对齐 (去掉第一个 token)
+                shift_weights = loss_weight_mask[:, 1:].contiguous().to(shift_logits.dtype)  # [B, seq_len-1]
+                # 逐 token CE loss (reduction='none')
+                loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
+                per_token_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))  # [B*(seq_len-1)]
+                per_token_loss = per_token_loss.view(shift_labels.shape)  # [B, seq_len-1]
+                # 有效 token mask (labels != -100)
+                valid_mask = (shift_labels != -100).float()  # [B, seq_len-1]
+                # 加权 loss: 按 weight_mask 加权, 然后对有效 token 取加权均值
+                weighted_loss = per_token_loss * shift_weights * valid_mask
+                ce_loss = weighted_loss.sum() / (shift_weights * valid_mask).sum().clamp(min=1.0)
+            else:
+                loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+                ce_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             main_loss = ce_loss.detach()
 
-            # ====== KL 散度正则化: 防止 adapted logits 偏离基座 logits 太远 ======
-            # 核心思想: draft 只应做 "微调" 而非 "重写", KL 散度惩罚过大的分布偏移
-            # 只在有效 label 位置计算 KL (忽略 padding 和 prompt)
-            kl_loss = torch.tensor(0.0, device=device, dtype=ctrl_dtype)
-            if self.lambda_kl > 0:
-                with torch.no_grad():
-                    # 复用缓存的基座 logits (避免重复计算 lm_head(full_hidden))
-                    if _cached_base_logits is not None:
-                        base_log_probs = F.log_softmax(_cached_base_logits[:, :-1, :], dim=-1)
-                    else:
-                        base_logits_for_kl = lm_head(full_hidden)  # fallback: 重新计算
-                        base_log_probs = F.log_softmax(base_logits_for_kl[:, :-1, :], dim=-1)
-                        del base_logits_for_kl
-                    # 构建有效 token mask: 只在有 label 的位置计算 KL
-                    valid_mask = (shift_labels != -100)  # [B, seq_len-1]
+            # ====== Contrastive Draft Learning loss: 已弃用 ======
 
-                # adapted logits 的 log_softmax (有梯度)
-                adapted_log_probs = F.log_softmax(shift_logits, dim=-1)
+            # ====== Visual Grounding Loss: 方案 D 中不再使用 (无 G_c) ======
+            # grounding_loss 保持为 0, 但保留变量以兼容下游 loss 汇总
+            lambda_grounding = 0.0  # 方案 D: 禁用 grounding loss
 
-                # KL(base || adapted) = Σ p_base * (log p_base - log p_adapted)
-                # 使用 F.kl_div(input=log_adapted, target=log_base, log_target=True)
-                # 逐 token 计算, 然后只对有效位置取均值
-                kl_per_token = F.kl_div(
-                    adapted_log_probs,
-                    base_log_probs.detach(),
-                    reduction='none',
-                    log_target=True,
-                ).sum(dim=-1)  # [B, seq_len-1]
+            # ====== Commit Gate Loss: 正负样本联合监督 ======
+            # 正样本: boundary 位置 (chunk 末尾) 的 commit_score → target=1.0 (应该 commit)
+            # 负样本来源 (两类):
+            #   1. 每个 boundary chunk 的前半段 (step 内部中间位置) → target=0.0 (推理还在进行, 不该 commit)
+            #   2. 最后一个非 boundary chunk (Answer 区域) → target=0.0 (已经结束推理, 不该 commit)
+            # 核心: 负样本主要来自 step 内部, 让 CommitGate 学会区分 "step 边界" vs "step 中间"
+            commit_loss = torch.tensor(0.0, device=device, dtype=ctrl_dtype)
+            lambda_commit = 0.1  # commit loss 权重 (不宜过大, 避免干扰主 loss)
+            all_commit_scores = rld_state.get('_all_commit_scores', [])
+            all_neg_commit_scores = rld_state.get('_all_neg_commit_scores', [])
+            _n_pos = len(all_commit_scores)
+            _n_neg = len(all_neg_commit_scores)
+            if _n_pos + _n_neg > 0:
+                # 注意: F.binary_cross_entropy 在 bf16 autocast 下被硬性禁止,
+                # 必须在 autocast(enabled=False) 上下文中用 float32 计算
+                with torch.amp.autocast('cuda', enabled=False):
+                    # 正样本 loss: boundary 位置 → target=1.0
+                    pos_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+                    if _n_pos > 0:
+                        commit_targets_pos = torch.ones(1, device=device, dtype=torch.float32)
+                        for cs in all_commit_scores:
+                            pos_loss = pos_loss + F.binary_cross_entropy(
+                                cs.float(), commit_targets_pos.expand_as(cs),
+                                reduction='mean'
+                            )
+                        pos_loss = pos_loss / _n_pos
 
-                # 只对有效 label 位置取均值
-                if valid_mask.any():
-                    kl_loss = (kl_per_token * valid_mask.float()).sum() / valid_mask.float().sum().clamp(min=1.0)
-                else:
-                    kl_loss = kl_per_token.mean()
+                    # 负样本 loss: step 内部中间位置 + Answer 区域 → target=0.0
+                    neg_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+                    if _n_neg > 0:
+                        commit_targets_neg = torch.zeros(1, device=device, dtype=torch.float32)
+                        for cs in all_neg_commit_scores:
+                            neg_loss = neg_loss + F.binary_cross_entropy(
+                                cs.float(), commit_targets_neg.expand_as(cs),
+                                reduction='mean'
+                            )
+                        neg_loss = neg_loss / _n_neg
 
-                del base_log_probs, adapted_log_probs, kl_per_token  # 释放显存
+                    # 正负样本均衡加权: 现在每个 boundary chunk 同时贡献 1 正 + 1 负,
+                    # 正负样本数量基本平衡, 使用 1:1 权重
+                    commit_loss = (pos_loss + neg_loss) / 2.0
 
-            # 释放缓存的基座 logits (KL 散度已使用完毕)
-            if _cached_base_logits is not None:
-                del _cached_base_logits
+            total_loss = ce_loss + div_loss.float() + lambda_commit * commit_loss + lambda_grounding * grounding_loss.float()
 
-            # ====== Scale L2 软约束: 温和地拉回 scale, 替代硬 clamp 的梯度断裂问题 ======
-            # 硬 clamp 在 scale > max_scale 时梯度为 0 (卡死), L2 正则化始终有梯度
-            # lambda_scale_l2 * Σ scale² → scale 被温和地拉向 0
-            # 配合 adapter 内部的范数比约束 (max_adapt_ratio=15%), 双重保障
-            scale_l2_loss = torch.tensor(0.0, device=device, dtype=ctrl_dtype)
-            lambda_scale_l2 = 0.1  # Scale L2 正则化权重
-            for _idx_str, _adapter in self.readout_adapter.adapters.items():
-                scale_l2_loss = scale_l2_loss + _adapter.scale ** 2
-            scale_l2_loss = lambda_scale_l2 * scale_l2_loss
-
-            total_loss = ce_loss + div_loss + self.lambda_kl * kl_loss + scale_l2_loss
+        # ====== DEBUG: dtype 追踪 (定位 Expected BFloat16 got Float) ======
+        if _rank == 0 and self._fwd_count <= 2:
+            print(f"\n🔍 [DEBUG dtype] forward #{self._fwd_count}:", flush=True)
+            print(f"  total_loss: dtype={total_loss.dtype}, grad_fn={total_loss.grad_fn}", flush=True)
+            if labels is not None:
+                print(f"  ce_loss: dtype={ce_loss.dtype}", flush=True)
+                print(f"  div_loss: dtype={div_loss.dtype}", flush=True)
+                print(f"  commit_loss: dtype={commit_loss.dtype}", flush=True)
+                print(f"  logits: dtype={logits.dtype}", flush=True)
+                print(f"  adapted_hidden: dtype={adapted_hidden.dtype}", flush=True)
+                if len(all_Z_d) > 0:
+                    print(f"  Z_d_current: dtype={Z_d_current.dtype}", flush=True)
+                if len(all_chunk_hidden) > 0:
+                    print(f"  chunk_hidden[0]: dtype={all_chunk_hidden[0].dtype}", flush=True)
+                # 检查 prefix_kv_projector 参数 dtype
+                _pkv_dtype = next(self.prefix_kv_projector.parameters()).dtype
+                print(f"  prefix_kv_projector param dtype: {_pkv_dtype}", flush=True)
+                # 检查 LoRA 参数 dtype
+                if self._lora_enabled:
+                    for name, param in self.base_model.named_parameters():
+                        if 'lora_A' in name:
+                            print(f"  LoRA param '{name}': dtype={param.dtype}", flush=True)
+                            break
 
         # 确保 total_loss 有 grad_fn (DeepSpeed 要求)
         if total_loss.grad_fn is None and self.training:
@@ -886,7 +1347,7 @@ class RLDModel(nn.Module):
                   f"total_loss={total_loss.item()}, main_loss={main_loss.item()}, "
                   f"div_loss={_div_val}",
                   flush=True)
-            total_loss = torch.tensor(0.0, device=device, dtype=ctrl_dtype, requires_grad=True)
+            total_loss = torch.tensor(0.0, device=device, dtype=torch.float32, requires_grad=True)
             anchor = next(self.controller.parameters())
             total_loss = total_loss + (anchor.sum() * 0.0).to(total_loss.dtype)
 
@@ -897,50 +1358,114 @@ class RLDModel(nn.Module):
                 state=rld_state,
             )
             _draft_metrics_accum['draft/num_steps'] = float(len(split_points))
-            _draft_metrics_accum['draft/readout_scale'] = self.readout_adapter.scale.detach().item()
-            # Top-K Rerun: 记录每个注入层 adapter 的 scale
-            for idx_str, adapter in self.readout_adapter.adapters.items():
-                _draft_metrics_accum[f'draft/readout_scale_L{idx_str}'] = adapter.scale.detach().item()
+            _draft_metrics_accum['draft/num_chunks'] = float(len(chunk_ranges))
+            # Prefix KV 注入效果量化指标 (用于 TensorBoard)
+            # 注意: 在 prefix KV 方案中, full_hidden 就是 adapted_hidden
+            # 需要与无 prefix 的基座输出对比才有意义
+            # 这里暂时记录 adapted_hidden 的范数作为基线
+            _draft_metrics_accum['draft/adapted_hidden_norm'] = adapted_hidden.float().detach().norm(dim=-1).mean().item()
 
-            # 多层注入效果量化指标 (用于 TensorBoard)
-            _diff_for_metric = (adapted_hidden - full_hidden.to(adapted_hidden.dtype)).float()
-            _draft_metrics_accum['draft/inject_norm_mean'] = _diff_for_metric.norm(dim=-1).mean().item()
-            _draft_metrics_accum['draft/inject_ratio'] = (
-                _diff_for_metric.norm(dim=-1).mean().item() /
-                max(full_hidden.float().norm(dim=-1).mean().item(), 1e-8)
-            )
+            # ====== 秩演化追踪 (per-step) ======
+            if _per_step_ranks:
+                _zd_ranks = [r['Zd_rank'] for r in _per_step_ranks]
+                _t_ranks = [r['T_rank'] for r in _per_step_ranks]
+                _zd_cosims = [r['Zd_cosim'] for r in _per_step_ranks]
+                # 秩演化统计
+                _draft_metrics_accum['rank/Zd_rank_first'] = _zd_ranks[0]
+                _draft_metrics_accum['rank/Zd_rank_last'] = _zd_ranks[-1]
+                _draft_metrics_accum['rank/Zd_rank_min'] = min(_zd_ranks)
+                _draft_metrics_accum['rank/Zd_rank_max'] = max(_zd_ranks)
+                _draft_metrics_accum['rank/Zd_rank_trend'] = _zd_ranks[-1] - _zd_ranks[0]  # 正=秩增长, 负=秩坍塌
+                _draft_metrics_accum['rank/T_rank_last'] = _t_ranks[-1]
+                _draft_metrics_accum['rank/T_rank_min'] = min(_t_ranks)
+                # cosim 演化
+                _draft_metrics_accum['rank/Zd_cosim_first'] = _zd_cosims[0]
+                _draft_metrics_accum['rank/Zd_cosim_last'] = _zd_cosims[-1]
+                _draft_metrics_accum['rank/Zd_cosim_trend'] = _zd_cosims[-1] - _zd_cosims[0]  # 正=趋向坍塌
+                # 完整轨迹 (用于详细监控打印, 不写入 TensorBoard)
+                _draft_metrics_accum['rank/_per_step_ranks'] = _per_step_ranks  # list of dict
 
-            # 四重防线监控指标
-            _draft_metrics_accum['loss/kl_loss'] = kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss
-            _draft_metrics_accum['loss/scale_l2_loss'] = scale_l2_loss.item() if isinstance(scale_l2_loss, torch.Tensor) else 0.0
-            # 选择性注入权重统计: 反映基座置信度分布
-            if _inject_weight is not None:
-                _iw = _inject_weight.squeeze(-1)  # [B, seq_len]
-                _draft_metrics_accum['draft/inject_weight_mean'] = _iw.mean().item()
-                _draft_metrics_accum['draft/inject_weight_min'] = _iw.min().item()
-                _draft_metrics_accum['draft/inject_weight_max'] = _iw.max().item()
-                _draft_metrics_accum['draft/inject_weight_std'] = _iw.std().item()
-                # 分位数统计: 了解 inject_weight 的分布形态
-                _draft_metrics_accum['draft/inject_weight_p10'] = _iw.quantile(0.1).item()
-                _draft_metrics_accum['draft/inject_weight_p25'] = _iw.quantile(0.25).item()
-                _draft_metrics_accum['draft/inject_weight_median'] = _iw.quantile(0.5).item()
-                _draft_metrics_accum['draft/inject_weight_p75'] = _iw.quantile(0.75).item()
-                _draft_metrics_accum['draft/inject_weight_p90'] = _iw.quantile(0.9).item()
-                # 分桶占比: 直观了解基座置信度分布
-                # 低注入 (weight < 0.1): 基座非常确定, draft 几乎不参与
-                _draft_metrics_accum['draft/iw_bucket_very_low'] = (_iw < 0.1).float().mean().item()
-                # 低注入 (0.1 ≤ weight < 0.2): 基座较确定
-                _draft_metrics_accum['draft/iw_bucket_low'] = ((_iw >= 0.1) & (_iw < 0.2)).float().mean().item()
-                # 中注入 (0.2 ≤ weight < 0.5): 基座中等不确定, draft 有意义的辅助区间
-                _draft_metrics_accum['draft/iw_bucket_medium'] = ((_iw >= 0.2) & (_iw < 0.5)).float().mean().item()
-                # 高注入 (0.5 ≤ weight < 0.8): 基座较不确定, draft 重要发力区间
-                _draft_metrics_accum['draft/iw_bucket_high'] = ((_iw >= 0.5) & (_iw < 0.8)).float().mean().item()
-                # 极高注入 (weight ≥ 0.8): 基座犯错, draft 关键修正区间
-                _draft_metrics_accum['draft/iw_bucket_very_high'] = (_iw >= 0.8).float().mean().item()
-                # 有效训练信号占比: inject_weight ≥ 0.2 的 token 才能提供有意义的梯度
-                _draft_metrics_accum['draft/effective_signal_ratio'] = (_iw >= 0.2).float().mean().item()
-                # 兼容旧指标名
-                _draft_metrics_accum['draft/low_inject_ratio'] = (_iw < 0.2).float().mean().item()
+            # Z_d_init 基线秩 (对比用)
+            _draft_metrics_accum['rank/Zd_init_rank'] = self.controller._effective_rank(Z_d_init.detach())
+            _draft_metrics_accum['rank/Zd_init_cosim'] = self.controller._slot_cosine_similarity(Z_d_init.detach())
+
+            # ====== 方案 D: 隐空间流监控指标 ======
+            # LayerScale: per-slot 可学习缩放因子 γ_i 的统计
+            if hasattr(self.controller.latent_draft_flow, 'slot_scale'):
+                _ss = self.controller.latent_draft_flow.slot_scale.detach().squeeze()  # [K_d]
+                _draft_metrics_accum['draft/slot_scale_mean'] = _ss.mean().item()
+                _draft_metrics_accum['draft/slot_scale_max'] = _ss.max().item()
+                _draft_metrics_accum['draft/slot_scale_min'] = _ss.min().item()
+                _draft_metrics_accum['draft/slot_scale_std'] = _ss.std().item()
+
+            # TraceEMA: per-slot 可学习记忆保留率 α_i 的统计
+            if hasattr(self.controller, 'trace_ema') and hasattr(self.controller.trace_ema, 'alpha_logit'):
+                _alpha = torch.sigmoid(self.controller.trace_ema.alpha_logit.detach()).squeeze()  # [K_t]
+                _draft_metrics_accum['draft/trace_ema_alpha_mean'] = _alpha.mean().item()
+                _draft_metrics_accum['draft/trace_ema_alpha_max'] = _alpha.max().item()
+                _draft_metrics_accum['draft/trace_ema_alpha_min'] = _alpha.min().item()
+                _draft_metrics_accum['draft/trace_ema_alpha_std'] = _alpha.std().item()
+
+            if rld_state.get('visual_hidden_proj') is not None:
+                _vhp = rld_state['visual_hidden_proj'].detach()
+                _draft_metrics_accum['draft/visual_proj_num_tokens'] = float(_vhp.shape[1])
+                _draft_metrics_accum['draft/visual_proj_norm'] = _vhp.norm(dim=-1).mean().item()
+                # Z_d 与 S_c 的余弦相似度 (验证 draft flow 的信息融合效果)
+                if len(step_summaries) > 0:
+                    _last_Zd = rld_state['Z_d'].detach().mean(dim=1)  # [B, d_z]
+                    _last_S_c = step_summaries[-1].detach().mean(dim=1)  # [B, d_z]
+                    _zd_sc_cosim = F.cosine_similarity(_last_Zd, _last_S_c, dim=-1).mean().item()
+                    _draft_metrics_accum['draft/Zd_Sc_cosim'] = _zd_sc_cosim
+                    _draft_metrics_accum['draft/Sc_norm'] = step_summaries[-1].detach().norm(dim=-1).mean().item()
+                    _draft_metrics_accum['draft/Sc_effective_rank'] = self.controller._effective_rank(step_summaries[-1].detach())
+                    _draft_metrics_accum['draft/Sc_slot_cosim'] = self.controller._slot_cosine_similarity(step_summaries[-1].detach())
+
+            # ====== 新增: Per-token loss 分解 (think vs answer) + Top-K 准确率 ======
+            # 帮助判断模型在推理步骤和最终答案上的学习进度
+            if loss_weight_mask is not None and labels is not None:
+                _shift_labels = labels[:, 1:].contiguous()
+                _shift_weights = loss_weight_mask[:, 1:].contiguous().float()
+                _valid = (_shift_labels != -100)
+
+                # 区分 think token (weight ≈ 1.0) 和 answer token (weight > 1.0)
+                _think_mask = _valid & (_shift_weights <= 1.01)  # think: weight=1.0
+                _answer_mask = _valid & (_shift_weights > 1.01)  # answer: weight>1.0
+
+                # Per-region loss (未加权的原始 CE loss)
+                _loss_fct_none = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
+                _per_token_ce = _loss_fct_none(
+                    logits[:, :-1, :].contiguous().view(-1, logits.size(-1)),
+                    _shift_labels.view(-1)
+                ).view(_shift_labels.shape)
+
+                if _think_mask.any():
+                    _draft_metrics_accum['loss/think_ce'] = (_per_token_ce * _think_mask.float()).sum().item() / _think_mask.float().sum().item()
+                    _draft_metrics_accum['loss/think_token_count'] = _think_mask.float().sum().item()
+                if _answer_mask.any():
+                    _draft_metrics_accum['loss/answer_ce'] = (_per_token_ce * _answer_mask.float()).sum().item() / _answer_mask.float().sum().item()
+                    _draft_metrics_accum['loss/answer_token_count'] = _answer_mask.float().sum().item()
+
+                # Top-1 / Top-5 准确率 (在有效 token 上)
+                if _valid.any():
+                    _pred_top1 = logits[:, :-1, :].contiguous().argmax(dim=-1)  # [B, seq_len-1]
+                    _top1_correct = (_pred_top1 == _shift_labels) & _valid
+                    _draft_metrics_accum['acc/top1_overall'] = _top1_correct.float().sum().item() / _valid.float().sum().item()
+
+                    if _think_mask.any():
+                        _draft_metrics_accum['acc/top1_think'] = (_top1_correct & _think_mask).float().sum().item() / _think_mask.float().sum().item()
+                    if _answer_mask.any():
+                        _draft_metrics_accum['acc/top1_answer'] = (_top1_correct & _answer_mask).float().sum().item() / _answer_mask.float().sum().item()
+
+                    # Top-5 准确率
+                    _pred_top5 = logits[:, :-1, :].contiguous().topk(5, dim=-1).indices  # [B, seq_len-1, 5]
+                    _top5_correct = (_pred_top5 == _shift_labels.unsqueeze(-1)).any(dim=-1) & _valid
+                    _draft_metrics_accum['acc/top5_overall'] = _top5_correct.float().sum().item() / _valid.float().sum().item()
+
+                    if _answer_mask.any():
+                        _draft_metrics_accum['acc/top5_answer'] = (_top5_correct & _answer_mask).float().sum().item() / _answer_mask.float().sum().item()
+
+            # ====== Contrastive Draft Learning 监控指标: 已弃用 ======
+            _draft_metrics_accum['loss/grounding_loss'] = grounding_loss.item() if isinstance(grounding_loss, torch.Tensor) else 0.0
 
         # ====== forward 阶段耗时汇总 ======
         _fwd_end = _time.time()
@@ -950,29 +1475,29 @@ class RLDModel(nn.Module):
         if _should_profile or _force_profile:
             _t_vision = _t_vision_end - _t_vision_start
             _t_base = _t_base_fwd_end - _t_base_fwd_start
-            _t_pass2 = _t_pass2_end - _t_pass2_start
-            _t_rest = _fwd_total - _t_vision - _t_base - _t_pass2
+            _t_rest = _fwd_total - _t_vision - _t_base
             _warn = " ⚠️ SLOW" if _fwd_total > 30 else ""
             print(f"[rank {_rank}] fwd#{self._fwd_count} 耗时: "
                   f"total={_fwd_total:.1f}s (vision={_t_vision:.1f}s, "
-                  f"pass1={_t_base:.1f}s, pass2={_t_pass2:.1f}s, "
+                  f"chunkwise_fwd={_t_base:.1f}s, "
                   f"ctrl+loss={_t_rest:.1f}s) "
-                  f"steps={len(split_points)} rerun_k={self.rerun_k}{_warn}", flush=True)
+                  f"chunks={len(chunk_ranges)} steps={len(split_points)} prefix_slots={N_p}{_warn}", flush=True)
 
         return {
             'loss': total_loss,
             'main_loss': main_loss,
             'div_loss': div_loss.detach(),
-            'kl_loss': kl_loss.detach() if isinstance(kl_loss, torch.Tensor) else torch.tensor(0.0),
+            'commit_loss': commit_loss.detach() if isinstance(commit_loss, torch.Tensor) else torch.tensor(0.0),
+            'grounding_loss': grounding_loss.detach() if isinstance(grounding_loss, torch.Tensor) else torch.tensor(0.0),
             'logits': None,  # 不返回完整 logits (太大)
             'rld_state': rld_state,
             'draft_metrics': _draft_metrics_accum,
         }
 
     # ================================================================
-    # 推理流程: 训推一致的 readout adapter 模式
-    # 每个 token 生成后，用 readout_adapter 修正 hidden → logits
-    # 遇到 </step> 时 controller.step_update 更新 Z_d
+    # 推理流程: 训推一致的 prefix KV 注入模式
+    # prefix KV 写入 DynamicCache 头部, 后续 token 自然看到
+    # 遇到 step boundary 时 controller.step_update 更新 Z_d
     # ================================================================
 
     @torch.no_grad()
@@ -988,19 +1513,20 @@ class RLDModel(nn.Module):
         do_sample: bool = True,
     ) -> torch.Tensor:
         """
-        推理时的生成 (Top-K Rerun 训推一致: 使用 forward hook in-situ injection)
+        推理时的生成 (Persistent Prefix KV Memory 方案)
         
         核心设计:
-        - 在注入层 (如 L35) 注册 forward hook, 自动修正 hidden states
-        - 修正后的 hidden 写入 KV cache, 后续 token 的 self-attention 自然看到修正值
-        - 遇到 </step> delimiter 时触发 controller.step_update 更新 Z_d
-        - hook 中引用的 Z_d 会实时更新, 无需手动管理
+        - 在 prefill 阶段, 将 Z_d 投影的 prefix KV 写入 DynamicCache 头部
+        - 后续每个 token 的 self-attention 自然看到 prefix KV (标准 KV cache 行为)
+        - 遇到 step boundary 时触发 controller.step_update 更新 Z_d
+        - 更新后覆写 cache 中 prefix 位置的 KV (原地更新, 无需重建 cache)
+        - 完全兼容 flash_attention_2
         """
         B = input_ids.shape[0]
         device = input_ids.device
 
         # 1. 视觉 encoder
-        inner_model = self.base_model.model
+        inner_model = self._inner_model
         _pixel_values = pixel_values.to(dtype=inner_model.visual.dtype)
         vision_output = inner_model.visual(
             _pixel_values, grid_thw=image_grid_thw
@@ -1027,10 +1553,33 @@ class RLDModel(nn.Module):
         # 2. 初始化 RLD 状态
         rld_state = self.controller.prefill(visual_tokens)
 
-        # 3. Prompt prefill (标准 KV cache)
-        text_model = inner_model.language_model
-        lm_head = self.base_model.lm_head
+        # 3. 计算初始 prefix KV 并写入 DynamicCache
+        N_p = self.num_prefix_slots
+        Z_d_current = rld_state['Z_d']  # [B, K_d, d_z]
+        prefix_kvs = self.prefix_kv_projector.get_all_prefix_kvs(Z_d_current)
+        # prefix_kvs: {layer_idx: (prefix_k, prefix_v)}
 
+        # 构建 DynamicCache, 预填充 prefix KV
+        # 注入层: 写入真实 prefix KV
+        # 非注入层: 写入零向量 (保持 cache 结构一致)
+        text_model = inner_model.language_model
+        lm_head = self._lm_head
+        injection_set = set(self.injection_layer_indices)
+
+        cache = DynamicCache()
+        for layer_idx in range(self.total_layers):
+            if layer_idx in injection_set:
+                pfx_k, pfx_v = prefix_kvs[layer_idx]
+            else:
+                # 非注入层: 零向量 prefix (对 attention 影响极小)
+                pfx_k = torch.zeros(B, self.num_kv_heads, N_p, self.head_dim,
+                                    device=device, dtype=Z_d_current.dtype)
+                pfx_v = torch.zeros(B, self.num_kv_heads, N_p, self.head_dim,
+                                    device=device, dtype=Z_d_current.dtype)
+            # 写入 cache (DynamicCache.update 会 cat 到已有 KV 后面)
+            cache.update(pfx_k, pfx_v, layer_idx)
+
+        # 4. Prompt prefill (prefix KV 已在 cache 中, cache_position 从 N_p 开始)
         prompt_embeds = inner_model.get_input_embeddings()(input_ids)
         image_token_id = inner_model.config.image_token_id
         image_mask = (input_ids == image_token_id)
@@ -1056,12 +1605,17 @@ class RLDModel(nn.Module):
             position_ids = torch.cat([text_pos.unsqueeze(0), position_ids], dim=0)
 
         visual_pos_masks = (input_ids == image_token_id) if pixel_values is not None else None
-        cache = DynamicCache()
-        cache_position = torch.arange(prompt_len, device=device)
+
+        # cache_position 从 N_p 开始 (prefix 占据 0~N_p-1)
+        cache_position = torch.arange(prompt_len, device=device) + N_p
+
+        # attention_mask 需要扩展: 前面加 N_p 个 1 (prefix 对所有 token 可见)
+        prefix_attn = torch.ones(B, N_p, device=device, dtype=attention_mask.dtype)
+        extended_attention_mask = torch.cat([prefix_attn, attention_mask], dim=1)
 
         prefill_out = text_model(
             inputs_embeds=prompt_embeds,
-            attention_mask=attention_mask,
+            attention_mask=extended_attention_mask,
             position_ids=position_ids,
             past_key_values=cache,
             cache_position=cache_position,
@@ -1072,114 +1626,32 @@ class RLDModel(nn.Module):
         past_key_values = prefill_out.past_key_values
         mrope_last_pos = position_ids[1:, :, -1:] if position_ids is not None else None
 
-        # ====== 注册 forward hook: 在注入层自动修正 hidden ======
-        # 使用可变引用 (list) 来持有当前 Z_d, hook 中通过引用读取最新值
-        Z_d_current = rld_state['Z_d']  # [B, K_d, d_z]
-        _z_d_ref = [Z_d_current]  # 可变容器, hook 中引用
-
-        # ====== 推理时选择性注入: 保证训推一致 ======
-        # 训练时 inject_weight 由基座 logits 计算, 推理时也需要同样的机制
-        # 使用可变引用持有当前 inject_weight, 每个 token 生成后更新
-        _inject_weight_ref = [None]  # [B, 1, 1] 或 None, hook 中引用
-
-        def _make_injection_hook(layer_idx, injector, z_d_ref, inject_weight_ref):
-            """为指定层创建 in-situ injection hook (支持选择性注入)"""
-            def hook_fn(module, input, output):
-                # output: [B, T, H] (T=1 for autoregressive, T=prompt_len for prefill)
-                z_d = z_d_ref[0]  # [B, K_d, d_z]
-                T = output.shape[1]
-                draft = z_d.unsqueeze(1).expand(-1, T, -1, -1)  # [B, T, K_d, d_z]
-                iw = inject_weight_ref[0]  # [B, 1, 1] 或 None
-                if iw is not None and T > 1:
-                    # prefill 阶段: inject_weight 可能需要扩展到 T
-                    iw = iw.expand(-1, T, -1)  # [B, T, 1]
-                return injector.inject_single_token(layer_idx, output, draft, inject_weight=iw)
-            return hook_fn
-
-        _hooks = []
-        for inj_layer_idx in self.readout_adapter.injection_layer_indices:
-            h = text_model.layers[inj_layer_idx].register_forward_hook(
-                _make_injection_hook(inj_layer_idx, self.readout_adapter, _z_d_ref, _inject_weight_ref)
-            )
-            _hooks.append(h)
-
-        # ★ prefill 最后一个 token 的 logits (hook 已注册，但 prefill 已经跑完了)
-        # 需要用 adapter 手动修正最后一个 token
+        # prefill 最后一个 token 的 logits
         prefill_hidden = prefill_out.last_hidden_state  # [B, prompt_len, H]
-        last_hidden = prefill_hidden[:, -1:, :]  # [B, 1, H]
-        last_draft = Z_d_current.unsqueeze(1)  # [B, 1, K_d, d_z]
+        next_token_logits = lm_head(prefill_hidden[:, -1, :])  # [B, V]
 
-        # ====== 推理时选择性注入: 计算 prefill 最后 token 的 inject_weight ======
-        if self.selective_injection:
-            _prefill_logits = lm_head(last_hidden)  # [B, 1, V]
-            _prefill_probs = F.softmax(_prefill_logits, dim=-1)
-            _prefill_conf = _prefill_probs.max(dim=-1).values  # [B, 1]
-            _prefill_iw = (1.0 - _prefill_conf).clamp(min=0.05).unsqueeze(-1)  # [B, 1, 1]
-            _inject_weight_ref[0] = _prefill_iw
-            del _prefill_logits, _prefill_probs
-        
-        adapted_last = self.readout_adapter.forward_single_token(
-            last_hidden, last_draft, inject_weight=_inject_weight_ref[0]
-        )  # [B, 1, H]
-        next_token_logits = lm_head(adapted_last).squeeze(1)  # [B, V]
+        # ====== Streaming Trace Accumulator: 用 prefill hidden 初始化 S_running ======
+        # 用 prefill 最后一个 token 的 hidden 做一次初始累积
+        rld_state = self.controller.streaming_accumulate(rld_state, prefill_hidden[:, -1:, :])
 
-        # 收集 step hidden 用于 delimiter 触发时的 step_update
-        step_hidden_buffers = [[] for _ in range(B)]
-        for b in range(B):
-            step_hidden_buffers[b].append(prefill_hidden[b:b+1])
-
-        # 4. 追加 <think>\n token
-        think_start_text = "<think>\n"
-        think_start_ids = self.processor.tokenizer.encode(
-            think_start_text, add_special_tokens=False, return_tensors="pt"
-        ).to(device)
-        think_start_ids = think_start_ids.expand(B, -1)
-        think_start_len = think_start_ids.shape[1]
-
-        actual_cache_len = self._get_full_attn_cache_len(past_key_values)
-        think_start_attn = torch.ones(B, actual_cache_len + think_start_len, device=device, dtype=attention_mask.dtype)
-
-        think_mrope_pos = mrope_last_pos + 1
-        if think_start_len > 1:
-            think_mrope_offsets = torch.arange(think_start_len, device=device).view(1, 1, -1)
-            think_mrope_pos_full = think_mrope_pos + think_mrope_offsets
-        else:
-            think_mrope_pos_full = think_mrope_pos
-        think_text_pos = torch.arange(actual_cache_len, actual_cache_len + think_start_len, device=device).unsqueeze(0).expand(B, -1)
-        think_position_ids = torch.cat([think_text_pos.unsqueeze(0), think_mrope_pos_full], dim=0)
-
-        think_start_embeds = inner_model.get_input_embeddings()(think_start_ids)
-        think_cache_pos = torch.arange(actual_cache_len, actual_cache_len + think_start_len, device=device)
-
-        think_outputs = text_model(
-            inputs_embeds=think_start_embeds,
-            attention_mask=think_start_attn,
-            position_ids=think_position_ids,
-            past_key_values=past_key_values,
-            cache_position=think_cache_pos,
-            use_cache=True,
-            visual_pos_masks=None,
-            deepstack_visual_embeds=None,
-        )
-        past_key_values = think_outputs.past_key_values
-
-        # ★ Hook 已注册, think forward 中最后一层的 hidden 已被 hook 修正
-        # 但 text_model.forward 内部在 decoder layers 之后还有 norm，
-        # last_hidden_state 是 norm(修正后的hidden), 可以直接用
-        # 注意: hook 修正的是 decoder layer 的输出, norm 在最后
-        next_token_logits = lm_head(think_outputs.last_hidden_state[:, -1:, :]).squeeze(1)  # [B, V]
-
-        mrope_last_pos = think_mrope_pos_full[:, :, -1:]
-
-        generated_ids = torch.cat([input_ids, think_start_ids], dim=-1)
+        # 句末标点 token ids (用于 CommitGate 的句末检测)
+        _tokenizer = self.processor.tokenizer if hasattr(self, 'processor') else None
+        _sentence_end_ids = set()
+        if _tokenizer is not None:
+            for punct in ['.', '。', '\n', ':', '：', ';', '；', '?', '？', '!', '！']:
+                _ids = _tokenizer.encode(punct, add_special_tokens=False)
+                _sentence_end_ids.update(_ids)
 
         # 5. 自回归生成
+        generated_ids = input_ids.clone()
         eos_token_id = self.processor.tokenizer.eos_token_id if hasattr(self, 'processor') else None
-        delim_ids = self.step_delimiter_ids
-        delim_len = len(delim_ids) if delim_ids is not None else 0
-        recent_tokens = [[] for _ in range(B)]
+        
+        # 保留正则 boundary 检测作为 fallback (双保险)
+        generated_text_buffers = ["" for _ in range(B)]
+        triggered_steps = [set() for _ in range(B)]
 
-        current_pos = actual_cache_len + think_start_len
+        actual_cache_len = self._get_full_attn_cache_len(past_key_values)
+        current_pos = actual_cache_len
 
         for gen_step in range(max_new_tokens):
             # 采样
@@ -1226,72 +1698,78 @@ class RLDModel(nn.Module):
             past_key_values = text_outputs.past_key_values
             hidden_states = text_outputs.last_hidden_state  # [B, 1, H]
 
-            # ★ Hook 已在注入层自动修正 hidden, last_hidden_state 是 norm(修正后) 的结果
-            # 直接过 lm_head 即可
+            # prefix KV 已在 cache 中, self-attention 自然看到 → hidden 已受 prefix 影响
             next_token_logits = lm_head(hidden_states[:, -1, :])  # [B, V]
-
-            # ====== 推理时选择性注入: 更新 inject_weight 供下一个 token 的 hook 使用 ======
-            # 基于当前 token 的 logits 计算置信度, 用于下一个 token 的注入控制
-            # 开销: 仅一次 softmax + max, 相比 lm_head 的矩阵乘法可忽略
-            if self.selective_injection:
-                with torch.no_grad():
-                    _gen_probs = F.softmax(next_token_logits, dim=-1)  # [B, V]
-                    _gen_conf = _gen_probs.max(dim=-1).values  # [B]
-                    _gen_iw = (1.0 - _gen_conf).clamp(min=0.05).unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
-                    _inject_weight_ref[0] = _gen_iw
 
             mrope_last_pos = new_mrope_pos
 
-            # 收集 step hidden
-            for b in range(B):
-                step_hidden_buffers[b].append(hidden_states[b:b+1])
+            # ====== Streaming Trace Accumulator: 每 token 增量更新 S_running ======
+            rld_state = self.controller.streaming_accumulate(rld_state, hidden_states)
 
-            # 检测 delimiter
+            # ====== CommitGate: 只在句末计算 commit score ======
+            # 检测当前 token 是否为句末标记
+            is_sentence_end = torch.zeros(B, dtype=torch.bool, device=device)
             for b in range(B):
-                recent_tokens[b].append(next_token[b].item())
-                if len(recent_tokens[b]) > delim_len:
-                    recent_tokens[b] = recent_tokens[b][-delim_len:]
+                if next_token[b].item() in _sentence_end_ids:
+                    is_sentence_end[b] = True
 
-            if delim_ids is not None and delim_len > 0:
-                trigger_mask = torch.zeros(B, dtype=torch.bool, device=device)
+            # 同时维护正则 boundary 检测作为 fallback
+            for b in range(B):
+                token_text = self.processor.tokenizer.decode([next_token[b].item()])
+                generated_text_buffers[b] += token_text
+
+            # 正则 fallback: 检测 "Step N:" 和 "Final Answer:"
+            regex_trigger_mask = torch.zeros(B, dtype=torch.bool, device=device)
+            for b in range(B):
+                buf = generated_text_buffers[b]
+                for m in re.finditer(r'Step\s+(\d+)\s*[:.]\s*', buf, re.IGNORECASE):
+                    step_num = int(m.group(1))
+                    if step_num >= 2 and step_num not in triggered_steps[b]:
+                        triggered_steps[b].add(step_num)
+                        regex_trigger_mask[b] = True
+                if re.search(r'Final\s+Answer\s*:', buf, re.IGNORECASE) and 'final_answer' not in triggered_steps[b]:
+                    triggered_steps[b].add('final_answer')
+                    regex_trigger_mask[b] = True
+
+            # CommitGate 触发判断 (只在句末计算)
+            trigger_mask = torch.zeros(B, dtype=torch.bool, device=device)
+            tokens_since_commit = rld_state.get('tokens_since_commit', 0)
+
+            if is_sentence_end.any() or tokens_since_commit >= self.controller.commit_gate.max_tokens:
+                # 计算 commit score
+                commit_score = self.controller.compute_commit_score(rld_state)
+                # 综合判断
+                trigger_mask = self.controller.commit_gate.should_commit(
+                    commit_score, tokens_since_commit, is_sentence_end
+                )
+
+            # 合并: CommitGate 触发 OR 正则 fallback 触发
+            trigger_mask = trigger_mask | regex_trigger_mask
+
+            if trigger_mask.any():
+                # 使用 commit_update (基于 S_running) 替代 step_update (基于 raw hidden)
+                rld_state = self.controller.commit_update(
+                    rld_state, update_mask=trigger_mask
+                )
+
+                # ★ 核心: 覆写 cache 中 prefix 位置的 KV (原地更新)
+                # 这是 Persistent Prefix Memory 的关键操作:
+                # Z_d 更新后, 重新投影 prefix KV, 覆写 cache 的前 N_p 个位置
+                # 后续 token 的 attention 自然看到新的 prefix KV
+                new_prefix_kvs = self.prefix_kv_projector.get_all_prefix_kvs(rld_state['Z_d'])
+                for layer_idx in self.injection_layer_indices:
+                    new_pfx_k, new_pfx_v = new_prefix_kvs[layer_idx]
+                    # 覆写 cache 中位置 0~N_p-1 的 KV
+                    # 使用 .layers[layer_idx] 直接访问 DynamicLayer 对象
+                    past_key_values.layers[layer_idx].keys[:, :, :N_p, :] = new_pfx_k
+                    past_key_values.layers[layer_idx].values[:, :, :N_p, :] = new_pfx_v
+
+                # 清理正则 fallback 的文本缓冲区
                 for b in range(B):
-                    if len(recent_tokens[b]) >= delim_len and recent_tokens[b][-delim_len:] == delim_ids:
-                        trigger_mask[b] = True
-
-                if trigger_mask.any():
-                    # 拼接 step hidden 用于 step_update
-                    max_buf_len = max(len(step_hidden_buffers[b]) for b in range(B))
-                    if max_buf_len > 0:
-                        padded_hiddens = []
-                        for b in range(B):
-                            if len(step_hidden_buffers[b]) > 0:
-                                h = torch.cat(step_hidden_buffers[b], dim=1)
-                            else:
-                                h = torch.zeros(1, 1, self.hidden_size, device=device, dtype=hidden_states.dtype)
-                            if h.shape[1] < max_buf_len:
-                                pad = torch.zeros(1, max_buf_len - h.shape[1], self.hidden_size,
-                                                  device=device, dtype=hidden_states.dtype)
-                                h = torch.cat([h, pad], dim=1)
-                            padded_hiddens.append(h)
-                        step_hiddens_gen = torch.cat(padded_hiddens, dim=0)
-
-                        # 更新 Z_d (controller.step_update，与训练一致)
-                        rld_state = self.controller.step_update(
-                            rld_state, step_hiddens_gen, update_mask=trigger_mask
-                        )
-                        # 更新 hook 中的 Z_d 引用 (可变容器, hook 实时读取)
-                        _z_d_ref[0] = rld_state['Z_d']
-
-                    for b in range(B):
-                        if trigger_mask[b]:
-                            step_hidden_buffers[b] = []
-                            recent_tokens[b] = []
+                    if trigger_mask[b]:
+                        generated_text_buffers[b] = generated_text_buffers[b][-20:]
 
             current_pos += 1
-
-        # 清理 forward hooks
-        for h in _hooks:
-            h.remove()
 
         return generated_ids
 
@@ -1300,10 +1778,10 @@ class RLDModel(nn.Module):
     # ================================================================
 
     def save_pretrained(self, save_dir: str):
-        """保存 RLD Controller + ReadoutAdapter 参数 (兼容 ZeRO-3)"""
+        """保存 RLD Controller + PrefixKVProjector + LoRA 参数 (兼容 ZeRO-3)"""
         os.makedirs(save_dir, exist_ok=True)
         controller_path = os.path.join(save_dir, "rld_controller.pt")
-        adapter_path = os.path.join(save_dir, "rld_readout_adapter.pt")
+        adapter_path = os.path.join(save_dir, "rld_readout_adapter.pt")  # 文件名保持兼容旧 checkpoint
 
         try:
             import deepspeed
@@ -1316,7 +1794,7 @@ class RLDModel(nn.Module):
                         if self._verbose:
                             controller_state[name] = param.data.cpu().clone()
                 adapter_state = {}
-                for name, param in self.readout_adapter.named_parameters():
+                for name, param in self.prefix_kv_projector.named_parameters():
                     with deepspeed.zero.GatheredParameters(param):
                         if self._verbose:
                             adapter_state[name] = param.data.cpu().clone()
@@ -1324,31 +1802,108 @@ class RLDModel(nn.Module):
                     torch.save(controller_state, controller_path)
                     torch.save(adapter_state, adapter_path)
                     print(f"[RLD] Controller 已保存到 {controller_path} (ZeRO-3 gathered)")
-                    print(f"[RLD] ReadoutAdapter 已保存到 {adapter_path} (ZeRO-3 gathered)")
+                    print(f"[RLD] PrefixKVProjector 已保存到 {adapter_path} (ZeRO-3 gathered)")
+                # LoRA 保存 (ZeRO-3)
+                if self._lora_enabled and self._verbose:
+                    lora_dir = os.path.join(save_dir, "lora_adapter")
+                    self.base_model.save_pretrained(lora_dir)
+                    print(f"[RLD] LoRA adapter 已保存到 {lora_dir} (ZeRO-3)")
                 return
         except ImportError:
             pass
 
         if self._verbose:
             torch.save(self.controller.state_dict(), controller_path)
-            torch.save(self.readout_adapter.state_dict(), adapter_path)
+            torch.save(self.prefix_kv_projector.state_dict(), adapter_path)
             print(f"[RLD] Controller 已保存到 {controller_path}")
-            print(f"[RLD] ReadoutAdapter 已保存到 {adapter_path}")
+            print(f"[RLD] PrefixKVProjector 已保存到 {adapter_path}")
+            
+            # 保存 LoRA adapter
+            if self._lora_enabled:
+                lora_dir = os.path.join(save_dir, "lora_adapter")
+                self.base_model.save_pretrained(lora_dir)
+                print(f"[RLD] LoRA adapter 已保存到 {lora_dir}")
 
-    def load_pretrained(self, save_dir: str):
-        """加载 RLD Controller + ReadoutAdapter 参数"""
+    def load_pretrained(self, save_dir: str, skip_lora: bool = False):
+        """加载 RLD Controller + PrefixKVProjector + LoRA 参数
+        
+        Args:
+            save_dir: checkpoint 目录路径
+            skip_lora: 是否跳过 LoRA 权重加载 (Stage 2 LoRA 结构不同时设为 True)
+        """
         controller_path = os.path.join(save_dir, "rld_controller.pt")
-        state_dict = torch.load(controller_path, map_location="cpu")
-        self.controller.load_state_dict(state_dict)
-        if self._verbose:
-            print(f"[RLD] Controller 已从 {controller_path} 加载")
-
-        adapter_path = os.path.join(save_dir, "rld_readout_adapter.pt")
-        if os.path.exists(adapter_path):
-            adapter_state = torch.load(adapter_path, map_location="cpu")
-            self.readout_adapter.load_state_dict(adapter_state)
+        if os.path.exists(controller_path):
+            state_dict = torch.load(controller_path, map_location="cpu")
+            # strict=False: 兼容旧 checkpoint (可能缺少 _gc_inject_gate_logit 等新参数)
+            missing, unexpected = self.controller.load_state_dict(state_dict, strict=False)
             if self._verbose:
-                print(f"[RLD] ReadoutAdapter 已从 {adapter_path} 加载")
+                print(f"[RLD] Controller 已从 {controller_path} 加载")
+                if missing:
+                    print(f"[RLD]   新增参数 (使用默认值): {missing}")
+                if unexpected:
+                    print(f"[RLD]   旧参数 (已忽略): {unexpected}")
         else:
             if self._verbose:
-                print(f"[RLD] ⚠️ 未找到 ReadoutAdapter 权重: {adapter_path}")
+                print(f"[RLD] ⚠️ 未找到 Controller 权重: {controller_path}")
+
+        adapter_path = os.path.join(save_dir, "rld_readout_adapter.pt")  # 文件名保持兼容旧 checkpoint
+        if os.path.exists(adapter_path):
+            adapter_state = torch.load(adapter_path, map_location="cpu")
+            self.prefix_kv_projector.load_state_dict(adapter_state)
+            if self._verbose:
+                print(f"[RLD] PrefixKVProjector 已从 {adapter_path} 加载")
+        else:
+            if self._verbose:
+                print(f"[RLD] ⚠️ 未找到 PrefixKVProjector 权重: {adapter_path}")
+
+        # 将 controller 和 prefix_kv_projector 转换到与 base_model 相同的 dtype/device
+        # (load_state_dict 从 CPU float32 加载, 需要重新对齐)
+        target_dtype = next(self.base_model.parameters()).dtype
+        target_device = next(self.base_model.parameters()).device
+        self.controller = self.controller.to(dtype=target_dtype, device=target_device)
+        self.prefix_kv_projector = self.prefix_kv_projector.to(dtype=target_dtype, device=target_device)
+        if self._verbose:
+            print(f"[RLD] Controller & PrefixKVProjector 已转换到 dtype={target_dtype}, device={target_device}")
+        
+        # 加载 LoRA adapter (如果存在且未要求跳过)
+        lora_dir = os.path.join(save_dir, "lora_adapter")
+        if skip_lora:
+            if self._verbose:
+                print(f"[RLD] ⏭️ 跳过 LoRA 权重加载 (skip_lora=True, Stage 2 LoRA 结构不同)")
+        elif os.path.exists(lora_dir):
+            if PEFT_AVAILABLE:
+                from peft import PeftModel as _PeftModel
+                if self._lora_enabled:
+                    # setup_lora() 已调用, base_model 已是 PeftModel
+                    # 直接加载权重到已有的 LoRA 结构中, 避免双重包装
+                    import safetensors.torch
+                    adapter_weights_path = os.path.join(lora_dir, "adapter_model.safetensors")
+                    if os.path.exists(adapter_weights_path):
+                        lora_state = safetensors.torch.load_file(adapter_weights_path)
+                        missing, unexpected = self.base_model.load_state_dict(lora_state, strict=False)
+                        if self._verbose:
+                            print(f"[RLD] LoRA 权重已加载到已有 PeftModel (from {adapter_weights_path})")
+                            if missing:
+                                # 过滤掉非 lora 的 missing keys (正常情况)
+                                lora_missing = [k for k in missing if 'lora_' in k]
+                                if lora_missing:
+                                    print(f"[RLD]   LoRA missing keys: {lora_missing}")
+                    else:
+                        # 尝试 .bin 格式
+                        adapter_bin_path = os.path.join(lora_dir, "adapter_model.bin")
+                        if os.path.exists(adapter_bin_path):
+                            lora_state = torch.load(adapter_bin_path, map_location="cpu")
+                            self.base_model.load_state_dict(lora_state, strict=False)
+                            if self._verbose:
+                                print(f"[RLD] LoRA 权重已加载到已有 PeftModel (from {adapter_bin_path})")
+                else:
+                    # setup_lora() 未调用, 用 PeftModel.from_pretrained 加载
+                    self.base_model = _PeftModel.from_pretrained(
+                        self.base_model, lora_dir
+                    )
+                    self._lora_enabled = True
+                    if self._verbose:
+                        print(f"[RLD] LoRA adapter 已从 {lora_dir} 加载 (PeftModel.from_pretrained)")
+            else:
+                if self._verbose:
+                    print(f"[RLD] ⚠️ 发现 LoRA 权重但 peft 未安装: {lora_dir}")
