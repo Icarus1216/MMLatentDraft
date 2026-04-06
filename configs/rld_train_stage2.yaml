@@ -69,7 +69,7 @@ data:
   auto_split_steps: true
   skip_image_check: true
   min_pixels: 3136
-  max_pixels: 1003520
+  max_pixels: 501760              # ← 从 1003520 减半, vision encoder 20s→~10s
   max_seq_len: 2048
   hard_sample_max_ratio: 0.15    # 减少极难样本比例
   use_system_prompt: true
