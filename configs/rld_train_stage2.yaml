@@ -2,9 +2,7 @@
 #
 # 在 Stage 1 bidirection 基础上:
 #   1. LoRA: L9~L35 全层, 7 个 target modules (q/k/v/o_proj + gate/up/down_proj), r=32
-#   2. 数据: ~80K 纯 correct_cot 样本 (已移除所有 wrong_cot, 100% 干净数据)
-#      - correct_cot: 29.7K (rejection sampling 正确推理链)
-#      - dataset_converted: 50.3K (原始数据集转换)
+#   2. 数据: 80K 样本 (从 266K 原始数据随机采样, 旧格式→新格式转换, 100% CoT 参与 loss)
 #   3. 学习率: Controller=2e-5 (微调), LoRA=5e-6 (极小, 防灾难性遗忘)
 #   4. 放松约束: lambda_div=0.05, max_scale=0.5
 #   5. 从 Stage 1 bidirection checkpoint 加载 Controller + PrefixKVProjector

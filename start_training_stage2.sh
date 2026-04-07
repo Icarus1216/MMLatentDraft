@@ -42,17 +42,14 @@ if [ ! -d "$STAGE1_CKPT" ]; then
 fi
 echo "✅ Stage 1 checkpoint: $STAGE1_CKPT"
 
-# 检查干净数据是否存在
+# 检查训练数据是否存在
 CLEAN_DATA="./data/rld_stage2_clean.json"
 if [ ! -f "$CLEAN_DATA" ]; then
-    echo "⚠️ 干净数据不存在，正在生成..."
+    echo "⚠️ 训练数据不存在，正在从原始数据采样生成..."
     python3 scripts/build_clean_stage2_data.py \
-        --stage2_checked rld_training_stage2_checked.json \
-        --stage1_data data/rld_50k_newformat.json \
-        --raw_pool data/rld_mmathcot_filtered_checked.json \
+        --input data/rld_mmathcot_filtered_checked.json \
         --output "$CLEAN_DATA" \
-        --target_size 80000 \
-        --seed 42
+        --size 80000 --seed 42
     echo ""
 fi
 echo "✅ 训练数据: $CLEAN_DATA"
