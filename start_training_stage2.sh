@@ -1,7 +1,7 @@
 #!/bin/bash
 # RLD Stage 2 训练启动脚本
 # 方案 B: 全模块 LoRA (7 modules) + 扩展到 L9~L35 (27层)
-# 数据: Stage 1 50K + Stage 2 checked 59K 合并去重 ≈ 80K
+# 数据: 80K 纯 correct_cot (已移除所有 wrong_cot, 100% CoT 参与 loss)
 set -e
 
 echo "🚀 RLD Stage 2 训练启动 (方案 B: 全模块 LoRA + 扩展低层)"
@@ -42,17 +42,20 @@ if [ ! -d "$STAGE1_CKPT" ]; then
 fi
 echo "✅ Stage 1 checkpoint: $STAGE1_CKPT"
 
-# 检查合并数据是否存在
-MERGED_DATA="./data/rld_stage2_merged.json"
-if [ ! -f "$MERGED_DATA" ]; then
-    echo "⚠️ 合并数据不存在，正在生成..."
-    python3 scripts/merge_stage2_data.py \
+# 检查干净数据是否存在
+CLEAN_DATA="./data/rld_stage2_clean.json"
+if [ ! -f "$CLEAN_DATA" ]; then
+    echo "⚠️ 干净数据不存在，正在生成..."
+    python3 scripts/build_clean_stage2_data.py \
+        --stage2_checked rld_training_stage2_checked.json \
         --stage1_data data/rld_50k_newformat.json \
-        --stage2_data rld_training_stage2_checked.json \
-        --output "$MERGED_DATA"
+        --raw_pool data/rld_mmathcot_filtered_checked.json \
+        --output "$CLEAN_DATA" \
+        --target_size 80000 \
+        --seed 42
     echo ""
 fi
-echo "✅ 训练数据: $MERGED_DATA"
+echo "✅ 训练数据: $CLEAN_DATA"
 echo ""
 
 # NCCL 配置
@@ -71,7 +74,7 @@ mkdir -p outputs/rld_stage2_full_lora
 echo "📋 Stage 2 配置:"
 echo "  LoRA: r=32, alpha=64, 7 modules (q/k/v/o_proj + gate/up/down_proj)"
 echo "  LoRA 层范围: L9~L35 (27层)"
-echo "  数据: ~80K 样本, 2 epochs"
+echo "  数据: 80K 纯 correct_cot 样本, 2 epochs (100% CoT 参与 loss)"
 echo "  学习率: Controller=2e-5, LoRA=5e-5"
 echo ""
 
