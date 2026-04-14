@@ -6,23 +6,34 @@ __pycache__/
 dist/
 build/
 
-# 大型数据集目录（通过 HuggingFace 等渠道单独下载）
-data/MMathCoT-1M/
-data/SPAR-7M/
-data/ViRL39K/
-data/clevr-math/
+# 大型数据集目录
+data/
+!data/.gitkeep
 
 # 大型 JSON 数据文件
-data/rld_mmathcot_filtered.json
-data/rld_mmathcot_filtered_checked.json
-data/*.json
 *.json
+!configs/*.json
 !configs/*.yaml
 
 # 大型目录
-data/rejection_sampling/
 transformers/
 verl/
+
+# 模型权重
+models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# 训练输出
+outputs/
+
+# 日志
+logs/
+*.log
+wandb/
 
 # 备份文件
 *.bak
@@ -31,16 +42,6 @@ verl/
 # 测试结果
 test_results_*.json
 test_results_*.txt
-
-# 训练输出
-outputs/
-
-# 模型权重文件（如果有）
-*.safetensors
-*.bin
-*.pt
-*.pth
-*.ckpt
 
 # 系统文件
 .DS_Store
@@ -52,6 +53,5 @@ outputs/
 .vscode/
 .idea/
 
-# 日志
-*.log
-wandb/
+# 杂项
+=1.0.0

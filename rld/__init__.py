@@ -1,33 +1,16 @@
 """
-RLD (Reflective Latent Draft) —— 面向 Qwen3-VL 的步级"回看-验证"隐空间草稿
+NLD (Native Latent Draft) —— 基于 VLM 原生隐空间的自适应多步推理解码
 
 核心模块:
-- modules: 基础组件 (Resampler, CrossAttention, Embedding Projector 等)
-- controller: RLD 控制器，编排 draft 生命周期
-- model: 包装 Qwen3-VL 的 RLD 模型
+- model_v2: NLD 模型 (VLM 原生隐空间思考 + 全量微调)
+- latent_thinker: NativeLatentThinker 模块 (Coconut 式隐空间推理)
 - data: 数据集与 Collator
-- trainer: 自定义 Trainer (支持步段展开训练)
+- trainer_nld: NLD 专用 Trainer (DeepSpeed ZeRO 兼容)
 """
 
-from .modules import (
-    CrossAttentionBlock,
-    EvidenceResampler,
-    StepResampler,
-    StreamingTraceAccumulator,
-    CommitGate,
-    TraceUpdater,
-    TraceEMA,
-    ReflectionModule,
-    BidirectionalReflection,
-    DraftUpdater,
-    ResidualFlowDraftUpdater,
-    CurrentDominantDraftRefiner,
-    LatentDraftFlow,
-    PrefixKVProjector,
-)
-from .controller import RLDController
-from .model import RLDModel
-from .data import RLDDataset, RLDCollator
-from .trainer import RLDTrainer
+from .latent_thinker import NativeLatentThinker, ThoughtPrefixInjector, VisualProbe
+from .model_v2 import NLDModel
+from .data import NLDDataset, NLDCollator, LATENT_TOKEN
+from .trainer_nld import NLDTrainer
 
-__version__ = "0.1.0"
+__version__ = "0.4.0"

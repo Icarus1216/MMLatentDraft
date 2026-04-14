@@ -1,85 +1,157 @@
 #!/bin/bash
-# RLD (Reflective Latent Draft) 训练启动脚本
-# 默认使用 PyTorch DDP (torchrun), 如需使用 DeepSpeed 请设置: USE_DEEPSPEED=1
+# ============================================================
+# NLD 训练/推理启动脚本 - 适配 Gemini 平台
+#
+# 功能:
+#   1. 自动探测并初始化 conda 环境
+#   2. 激活 colamem conda 环境
+#   3. 启动训练或推理任务
+#
+# 用法:
+#   bash start_training.sh                          # 默认启动训练
+#   bash start_training.sh train                    # 启动训练
+#   bash start_training.sh train --resume /path     # 恢复训练
+#   bash start_training.sh inference                # 启动推理
+#   bash start_training.sh inference --checkpoint /path/to/ckpt
+# ============================================================
+
 set -e
 
-echo "🚀 RLD 训练启动"
+echo "🚀 NLD 训练启动 (Gemini 平台)"
 echo ""
 
-# 初始化 conda
+# ======================== Step 1: 初始化 conda ========================
 if [ -f "/root/miniconda3/etc/profile.d/conda.sh" ]; then
+    echo "🔧 初始化 conda (miniconda3)..."
     source /root/miniconda3/etc/profile.d/conda.sh
 elif [ -f "/opt/conda/etc/profile.d/conda.sh" ]; then
+    echo "🔧 初始化 conda (/opt/conda)..."
     source /opt/conda/etc/profile.d/conda.sh
 elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+    echo "🔧 初始化 conda ($HOME/miniconda3)..."
     source $HOME/miniconda3/etc/profile.d/conda.sh
+elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+    echo "🔧 初始化 conda (anaconda3)..."
+    source $HOME/anaconda3/etc/profile.d/conda.sh
+elif [ -n "$CONDA_EXE" ]; then
+    echo "🔧 使用环境变量中的 conda..."
+    eval "$($CONDA_EXE shell.bash hook)"
+else
+    echo "⚠️  未找到 conda，尝试直接使用 conda 命令..."
 fi
 
-# 激活环境
+# ======================== Step 2: 激活 conda 环境 ========================
 if command -v conda &> /dev/null; then
+    echo "✅ conda 已就绪"
+    
+    # 检查 colamem 环境是否存在
     if conda env list | grep -q "^colamem "; then
+        echo "🚀 激活 conda 环境: colamem"
         conda activate colamem
+        echo "✅ conda 环境已激活: $(conda info --envs | grep '*' | awk '{print $1}')"
+    else
+        echo "⚠️  未找到 conda 环境 'colamem'，使用当前环境"
+    fi
+else
+    echo "⚠️  conda 命令不可用，尝试激活 Python 虚拟环境..."
+    
+    # 回退到 Python 虚拟环境
+    if [ -z "$VIRTUAL_ENV" ]; then
+        if [ -d "/root/colamem" ]; then
+            echo "检测到虚拟环境 /root/colamem，正在激活..."
+            source /root/colamem/bin/activate
+        elif [ -d "$HOME/colamem" ]; then
+            echo "检测到虚拟环境 $HOME/colamem，正在激活..."
+            source $HOME/colamem/bin/activate
+        elif [ -d "colamem" ]; then
+            echo "检测到虚拟环境 ./colamem，正在激活..."
+            source colamem/bin/activate
+        elif [ -d "venv" ]; then
+            echo "检测到虚拟环境 ./venv，正在激活..."
+            source venv/bin/activate
+        else
+            echo "⚠️  未检测到任何环境，使用系统 Python"
+        fi
+    else
+        echo "✅ 虚拟环境已激活: $VIRTUAL_ENV"
     fi
 fi
+echo ""
 
-# 检测 GPU
+# ======================== Step 3: 检测 Python ========================
+if command -v python3 &> /dev/null; then
+    PYTHON=python3
+else
+    PYTHON=python
+fi
+
+echo "Python: $($PYTHON --version)"
+echo ""
+
+# ======================== Step 4: 检测 GPU ========================
 if command -v nvidia-smi &> /dev/null; then
     GPU_COUNT=$(nvidia-smi --list-gpus 2>/dev/null | wc -l || echo "8")
+    echo "============================================================"
+    echo "🔍 GPU 信息:"
+    nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
+    echo "============================================================"
 else
-    GPU_COUNT=8
+    GPU_COUNT=8  # Gemini 平台默认 8 卡
 fi
 
 echo "GPU 数量: $GPU_COUNT"
 echo ""
 
-# NCCL 配置
-export NCCL_DEBUG=WARN
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+# ======================== Step 5: 解析参数 ========================
+MODE="${1:-train}"  # 默认训练模式
+shift 2>/dev/null || true
 
-# NVLink P2P: 已通过 max_seq_len=2048 严格截断解决 OOM/cudaErrorContained
-# 如果再次出现 peer memory 越界, 取消注释下行禁用 P2P:
-# export NCCL_P2P_DISABLE=1
+# 收集剩余参数传递给子脚本
+EXTRA_ARGS="$@"
 
-# CUDA 同步调试: 让 CUDA 操作同步执行，精确定位异步错误
-# 调试完成后注释掉此行恢复性能
-# export CUDA_LAUNCH_BLOCKING=1
+# ======================== Step 6: 执行任务 ========================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# PyTorch 显存管理: 启用 expandable_segments 减少碎片化
-# 方案三每段 forward 中 DynamicLayer.update() 的 torch.cat 会创建大量临时 tensor,
-# expandable_segments 让 allocator 以更大块分配/释放, 减少碎片
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-# RLD 调试日志 (开启段循环详细日志 + 每段显存监控)
-# ⚠️ 调试模式会导致 rank 0 有额外的 lm_head 计算 + 大量打印, 增加 rank 间延迟
-# 稳定运行后建议关闭 (注释下行), 只保留 TensorBoard 指标监控
-# export RLD_DEBUG=1
-export RLD_DEBUG=0
-
-# 注意力实现: 使用 flash_attention_2 (性能最优)
-# 如果 flash-attn 有兼容性问题, 可切换到 sdpa:
-#   export RLD_ATTN_IMPL=sdpa
-
-# 创建输出目录
-mkdir -p outputs/rld_train
-
-# 分布式后端选择:
-#   默认: torchrun (PyTorch DDP) — 通信简单, 只需 1 次 allreduce 同步 61M 可训练参数
-#   可选: DeepSpeed ZeRO-2 — 设置 USE_DEEPSPEED=1 启用 (显存不是瓶颈时不推荐)
-# export USE_DEEPSPEED=1
-
-# 启动训练
-if [ "${USE_DEEPSPEED:-0}" = "1" ]; then
-    echo "📦 使用 DeepSpeed ZeRO-2 启动训练..."
-    deepspeed --num_gpus=$GPU_COUNT \
-        scripts/train.py \
-        --config configs/rld_train.yaml \
-        --use_deepspeed
-else
-    echo "📦 使用 PyTorch DDP (torchrun) 启动训练..."
-    torchrun --nproc_per_node=$GPU_COUNT \
-        scripts/train.py \
-        --config configs/rld_train.yaml
-fi
+case "${MODE}" in
+    train|training)
+        echo "============================================================"
+        echo "🚀 启动 NLD Phase 1 训练"
+        echo "============================================================"
+        echo ""
+        
+        # 创建输出目录
+        mkdir -p outputs/nld_train
+        
+        # 调用训练脚本，传递额外参数（包括 --gpus 覆盖自动检测的值）
+        bash "${SCRIPT_DIR}/scripts/run_train_nld.sh" --gpus ${GPU_COUNT} ${EXTRA_ARGS}
+        ;;
+    
+    infer|inference|eval)
+        echo "============================================================"
+        echo "🚀 启动 NLD 推理"
+        echo "============================================================"
+        echo ""
+        
+        $PYTHON "${SCRIPT_DIR}/scripts/inference.py" ${EXTRA_ARGS}
+        ;;
+    
+    *)
+        echo "用法: bash start_training.sh [train|inference] [额外参数...]"
+        echo ""
+        echo "模式:"
+        echo "  train       启动 NLD Phase 1 训练 (默认)"
+        echo "  inference   启动推理/评估"
+        echo ""
+        echo "训练额外参数:"
+        echo "  --resume /path/to/checkpoint   从检查点恢复训练"
+        echo "  --config /path/to/config.yaml  指定配置文件"
+        echo "  --gpus N                       指定 GPU 数量"
+        echo ""
+        echo "推理额外参数:"
+        echo "  --checkpoint /path/to/ckpt     指定模型检查点"
+        exit 1
+        ;;
+esac
 
 echo ""
-echo "✅ 训练完成！"
+echo "✅ ${MODE} 任务完成！"

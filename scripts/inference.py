@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-RLD 推理脚本
+NLD 推理脚本 (Native Latent Draft)
 
 使用方法:
     # 单张图像问答
     python scripts/inference.py \
         --model_path /path/to/qwen3-vl \
-        --rld_checkpoint ./outputs/rld_train/model \
+        --nld_checkpoint ./outputs/nld_train/model \
         --image /path/to/image.jpg \
         --question "What is shown in this image?"
     
     # 批量推理
     python scripts/inference.py \
         --model_path /path/to/qwen3-vl \
-        --rld_checkpoint ./outputs/rld_train/model \
+        --nld_checkpoint ./outputs/nld_train/model \
         --batch_file /path/to/queries.json \
         --output_file ./results.json
 """
@@ -29,69 +29,73 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from transformers import AutoProcessor
-from rld.model import RLDModel
-from rld.data import RLD_SYSTEM_PROMPT
+from rld.model_v2 import NLDModel
+from rld.data import NLD_SYSTEM_PROMPT, LATENT_TOKEN
 
 try:
     from qwen_vl_utils import process_vision_info
 except ImportError:
-    print("[RLD Inference] ⚠️ qwen_vl_utils 未安装")
+    print("[NLD Inference] ⚠️ qwen_vl_utils 未安装")
     process_vision_info = None
 
 
-class RLDInference:
-    """RLD 推理引擎"""
+class NLDInference:
+    """NLD 推理引擎"""
 
     def __init__(
         self,
         model_path: str,
-        rld_checkpoint: str,
+        nld_checkpoint: str,
         device: str = "cuda",
         torch_dtype=torch.bfloat16,
         attn_implementation: str = "flash_attention_2",
         # 模型参数
         hidden_size: int = 4096,
-        # RLD 参数
-        d_z: int = 768,
-        num_evidence_slots: int = 16,
-        num_draft_slots: int = 16,
-        num_trace_slots: int = 16,
         total_layers: int = 36,
+        # NLD 参数
+        max_think_steps: int = 6,
         # System prompt 控制
         use_system_prompt: bool = True,
         system_prompt: str = None,
     ):
         self.device = device
         self.use_system_prompt = use_system_prompt
-        self.system_prompt = system_prompt or RLD_SYSTEM_PROMPT
-        print(f"[RLD Inference] 初始化...")
+        self.system_prompt = system_prompt or NLD_SYSTEM_PROMPT
+        print(f"[NLD Inference] 初始化...")
         print(f"  - Model: {model_path}")
-        print(f"  - RLD Checkpoint: {rld_checkpoint}")
+        print(f"  - NLD Checkpoint: {nld_checkpoint}")
 
         # 加载 processor
         self.processor = AutoProcessor.from_pretrained(model_path)
+        
+        # 注册 <|latent|> 特殊 token
+        num_added = self.processor.tokenizer.add_special_tokens(
+            {"additional_special_tokens": [LATENT_TOKEN]}
+        )
+        latent_token_id = self.processor.tokenizer.convert_tokens_to_ids(LATENT_TOKEN)
+        print(f"  - <|latent|> token id: {latent_token_id} (新增 {num_added} 个)")
 
         # 加载模型
-        self.model = RLDModel(
+        self.model = NLDModel(
             model_path=model_path,
             hidden_size=hidden_size,
-            d_z=d_z,
-            num_evidence_slots=num_evidence_slots,
-            num_draft_slots=num_draft_slots,
-            num_trace_slots=num_trace_slots,
             total_layers=total_layers,
             torch_dtype=torch_dtype,
             attn_implementation=attn_implementation,
+            max_think_steps=max_think_steps,
         )
+        
+        # 调整 embedding 大小
+        self.model.base_model.resize_token_embeddings(len(self.processor.tokenizer))
         self.model.set_processor(self.processor)
 
-        # 加载 RLD controller 权重
-        if os.path.exists(rld_checkpoint):
-            self.model.load_pretrained(rld_checkpoint)
+        # 加载 NLD 权重
+        if os.path.exists(nld_checkpoint):
+            self.model.load_pretrained(nld_checkpoint)
 
         self.model.to(device)
         self.model.eval()
-        print("[RLD Inference] ✅ 初始化完成")
+        print("[NLD Inference] ✅ 初始化完成")
 
     def infer(
         self,
@@ -116,7 +120,7 @@ class RLDInference:
         Returns:
             answer: 生成的回答文本
         """
-        # 构造消息 (注入与训练一致的 system prompt)
+        # 构造消息
         messages = []
         if self.use_system_prompt:
             messages.append({
@@ -132,9 +136,6 @@ class RLDInference:
         text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        # 注意: 新格式下不需要追加任何前缀!
-        # model.py 的 generate() 方法直接从 generation prompt 后开始自回归生成,
-        # 模型会自主输出 "Step 1: ..." 格式 (由 system prompt 引导)。
         if process_vision_info:
             image_inputs, _ = process_vision_info(messages)
         else:
@@ -165,28 +166,19 @@ class RLDInference:
             generated_tokens, skip_special_tokens=False
         )
 
-        # 后处理: 用 "Final Answer:" 分割 CoT 和 final answer
-        # generated_ids 包含: [prompt | 生成内容]
-        # 生成内容的格式应为: "Step 1: ...\nStep 2: ...\nFinal Answer: {answer}<|im_end|>"
+        # 后处理: 用 "Final Answer:" 分割 reasoning 和 answer
+        # 生成内容格式: "{reasoning}<|latent|>{conclusion}\nFinal Answer:\n{answer}<|im_end|>"
+        # 清理 <|latent|> token (隐空间思考标记，不显示)
+        full_output = full_output.replace(LATENT_TOKEN, " [latent thinking] ")
+        
         if "Final Answer:" in full_output:
-            # 找到最后一个 "Final Answer:" (鲁棒处理多次出现的情况)
             fa_idx = full_output.rfind("Final Answer:")
-            cot_part = full_output[:fa_idx].strip()
+            reasoning_part = full_output[:fa_idx].strip()
             answer_part = full_output[fa_idx + len("Final Answer:"):].strip()
-            # 清理 answer 中的特殊标记
-            answer = answer_part.replace("<|im_end|>", "").strip()
-            # 清理 CoT 中的特殊标记 (兼容旧格式残留)
-            cot = cot_part.replace("</step>", " ").replace("<think>", "").replace("</think>", "").strip()
-        elif "</think>" in full_output:
-            # 兼容旧格式: 如果模型仍然输出 </think>
-            think_part, answer_part = full_output.split("</think>", 1)
-            cot = think_part.replace("</step>", " ").replace("<think>", "").strip()
             answer = answer_part.replace("<|im_end|>", "").strip()
         else:
-            # 异常情况: 模型未输出 "Final Answer:" 也未输出 "</think>"
-            # 尝试从末尾提取答案
-            answer = full_output.replace("<|im_end|>", "").replace("</step>", "").replace("<think>", "").replace("</think>", "").strip()
-            cot = None
+            # 模型未输出 "Final Answer:"，取全部输出作为答案
+            answer = full_output.replace("<|im_end|>", "").strip()
 
         return answer
 
@@ -223,9 +215,9 @@ class RLDInference:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RLD Inference")
+    parser = argparse.ArgumentParser(description="NLD Inference")
     parser.add_argument("--model_path", type=str, required=True, help="Qwen3-VL 模型路径")
-    parser.add_argument("--rld_checkpoint", type=str, required=True, help="RLD controller 权重路径")
+    parser.add_argument("--nld_checkpoint", type=str, required=True, help="NLD 模型权重路径")
     parser.add_argument("--image", type=str, default=None, help="图像路径")
     parser.add_argument("--question", type=str, default=None, help="问题文本")
     parser.add_argument("--batch_file", type=str, default=None, help="批量查询 JSON 文件")
@@ -235,9 +227,9 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", help="设备")
     args = parser.parse_args()
 
-    engine = RLDInference(
+    engine = NLDInference(
         model_path=args.model_path,
-        rld_checkpoint=args.rld_checkpoint,
+        nld_checkpoint=args.nld_checkpoint,
         device=args.device,
     )
 
