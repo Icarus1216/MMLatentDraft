@@ -30,6 +30,32 @@ models/
 # 训练输出
 outputs/
 
+# 评测 / 分析结果 (modality / manifold / paper figures)
+modality_analysis/results/
+modality_analysis/figures/
+modality_manifold_analysis/results/
+modality_manifold_analysis/results_v2/
+modality_manifold_analysis/results_v3/
+modality_manifold_analysis/results_subspace/
+modality_manifold_analysis/figures/
+modality_manifold_analysis/paper_figures/
+paper_tables_figures/*.pdf
+paper_tables_figures/*.png
+paper_tables_figures/*.tex
+
+# 通用大体积二进制
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.parquet
+*.html
+
 # 日志
 logs/
 *.log
@@ -55,3 +81,17 @@ test_results_*.txt
 
 # 杂项
 =1.0.0
+
+# 含内部平台/docker 自激活、或依赖已被清理脚本的失效 launcher (不上传)
+start_dp_eval_one_bench.sh
+start_eval_all_benchmarks.sh
+start_download_new_benchmarks.sh
+scripts/run_eval_benchmark.sh
+modality_analysis/scripts/run_stage1.sh
+modality_analysis/scripts/run_stage1b.sh
+modality_analysis/scripts/run_stage1c.sh
+modality_analysis/scripts/run_stage1_ckpt1200.sh
+modality_analysis/scripts/run_extract_embeddings.sh
+modality_analysis/scripts/run_extract_embeddings_ckpt1200.sh
+modality_manifold_analysis/scripts/run_manifold_with_generation.sh
+modality_manifold_analysis/scripts/run_manifold_analysis_with_docker.sh

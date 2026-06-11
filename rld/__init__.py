@@ -8,7 +8,7 @@ NLD (Native Latent Draft) —— 基于 VLM 原生隐空间的自适应多步推
 - trainer_nld: NLD 专用 Trainer (DeepSpeed ZeRO 兼容)
 """
 
-from .latent_thinker import NativeLatentThinker, ThoughtPrefixInjector, VisualProbe
+from .latent_thinker import NativeLatentThinker, ThoughtPrefixInjector
 from .model_v2 import NLDModel
 from .data import NLDDataset, NLDCollator, LATENT_TOKEN
 from .trainer_nld import NLDTrainer

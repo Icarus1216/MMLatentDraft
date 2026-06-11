@@ -1,0 +1,127 @@
+# ============================================================
+#  RLD Stage-2 · ERQA+VSI-Bench · ckpt-49 balanced 继续训练 (v2)
+#  ----------------------------------------------------------
+#  目标:
+#    - 从 outputs/rld_stage2_erqa_vsibench_ckpt49_balanced/checkpoint-49 继续训练
+#    - 使用 ERQA(400) + VSI-Bench(1162) = 1562 条混合数据
+#    - 训练 1 个 epoch
+#    - 核心调整: 增强 visual loss, 弱化 key_token loss, 使三者近似平衡
+#
+#  Loss 平衡分析 (基于 ckpt-49 训练末期数值):
+#    - CE loss (main_ce):     ~0.95  (权重 1.0, 不变)
+#    - key_token_loss (sw_srs): ~5.0 × 0.2 = ~1.0  (降权)
+#    - vision_loss:            ~0.07 × 5.0 × 3.0 = ~1.05  (增权)
+#    → 三者近似在 ~1.0 量级, 实现平衡训练
+#
+#  数据:
+#    data/erqa_vsibench_merged/erqa_vsibench_merged_1562.json (1562 samples)
+#
+#  起点 (resume_from_model_only):
+#    outputs/rld_stage2_erqa_vsibench_ckpt49_balanced/checkpoint-49
+# ============================================================
+
+# ============================================================
+# 基座模型
+# ============================================================
+model:
+  model_path: "/mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/for_lucas_Qwen3-VL-8B-Instruct_export"
+  hidden_size: 4096
+  total_layers: 36
+  torch_dtype: "bfloat16"
+  attn_implementation: "flash_attention_2"
+
+# ============================================================
+# NativeLatentThinker
+# ============================================================
+nld:
+  max_think_steps: 8
+  think_layer_start: 0
+  think_layer_end: 36
+  saturation_exit_threshold: 0.99
+
+  # ====== Loss 权重调整 (核心变化) ======
+  # key_token_weight: 从 1.0 降至 0.2
+  #   原因: sw_srs_loss 原始值 ~5.0, 乘以 0.2 后 ≈ 1.0, 与 CE loss 平衡
+  key_token_weight: 0.2
+
+  # Anti-Collapse (保持关闭)
+  exit_margin: 2.0
+  exit_margin_weight: 0.0
+  exit_margin_loss_weight: 0.0
+
+  sw_srs_alpha: 0.7
+  swsrs_anti_collapse_margin: 0.5
+  swsrs_anti_collapse_weight: 0.0
+  swsrs_anti_collapse_loss_weight: 0.0
+
+  diversity_threshold: 0.95
+  diversity_weight: 0.0
+  diversity_loss_weight: 0.0
+
+  # ====== Vision loss (大幅增强) ======
+  # vision_loss 原始值 ~0.07, 需要两级权重相乘 = 15 才能达到 ~1.0
+  # vision_loss_weight (latent_thinker 内部本地权重): 5.0 (从 1.0 提升)
+  # vision_loss_total_weight (model_v2 顶层权重): 3.0 (从 1.0 提升)
+  # 有效总权重 = 5.0 × 3.0 = 15.0
+  # 预期贡献: 0.07 × 15.0 ≈ 1.05
+  vision_loss_weight: 5.0
+  vision_loss_total_weight: 3.0
+  vision_top_k: 6
+  vision_margin: 0.05
+
+  # 从 ckpt-49 (balanced版) 加载模型权重
+  resume_from_model_only: "/mnt/cephszjt/user_juntianzhang/LatentDraft/outputs/rld_stage2_erqa_vsibench_ckpt49_balanced/checkpoint-49"
+
+# ============================================================
+# 数据 (ERQA + VSI-Bench 混合, 1562 samples)
+# ============================================================
+data:
+  train_json: "/mnt/cephszjt/user_juntianzhang/LatentDraft/data/erqa_vsibench_merged/erqa_vsibench_merged_1562.json"
+  image_base_dir: "/mnt/cephszjt/user_juntianzhang/LatentDraft"
+  skip_image_check: true
+  min_pixels: 3136             # 56x56 最小
+  max_pixels: 1048576          # 1024x1024 最大
+  max_seq_len: 8192
+  use_system_prompt: true
+
+# ============================================================
+# 训练
+# ============================================================
+training:
+  output_dir: "./outputs/rld_stage2_erqa_vsibench_ckpt49_balanced_v2"
+
+  # FSDP
+  fsdp: "full_shard auto_wrap"
+  fsdp_config: "configs/fsdp_config.json"
+
+  # 训练规模估算 (1 epoch):
+  #   1562 samples / (bs=1 * grad_accum=4 * 8 GPU) ≈ 49 effective steps/epoch
+  num_epochs: 1
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 4
+  gradient_checkpointing: false
+
+  # 学习率
+  learning_rate: 1.0e-5
+  thinker_lr: 1.0e-5
+  vlm_lr: 1.0e-5
+
+  weight_decay: 0.01
+  warmup_steps: 3
+  lr_scheduler_type: "cosine"
+  max_grad_norm: 0.5
+
+  # Logging / checkpoint
+  logging_steps: 5
+  monitor_every_n_steps: 5
+  save_steps: 25
+  save_total_limit: 4
+  eval_steps: 500
+  num_workers: 4
+  report_to: ["tensorboard"]
+
+# ============================================================
+# 随机种子
+# ============================================================
+seed: 42

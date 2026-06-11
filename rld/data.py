@@ -12,7 +12,8 @@ Dataset: 加载图像+问答数据，使用 VCR Latent Reasoning 格式:
          其中 reasoning_for_training 包含 <|latent|> token，
          模型在该位置触发隐空间思考。
          注意: 只有 <|latent|> 位置触发隐空间推理，Final Answer 后不触发。
-         每个 <|latent|> 的隐空间迭代步数由数据中 latent_key_tokens 的 stage 数决定。
+         每个 <|latent|> 触发点的隐空间迭代步数由数据中 latent_key_tokens 该 boundary
+         对应的 stage 数决定 (per-boundary, 不同触发点可有不同步数).
 
          Labels 策略:
            - prompt 部分: -100 (不参与 loss)
@@ -56,20 +57,32 @@ except ImportError:
 
 # ====== NLD System Prompt (VCR Latent Reasoning) ======
 # 引导模型进行视觉推理，在需要深度思考时输出 <|latent|> token
-# <|latent|> 触发隐空间思考，模型在隐空间中完成复杂推理后继续生成
+# <|latent|> 触发隐空间思考，模型在隐空间中完成复杂推理后继续生成。
+# 训练数据包含三种模式: no_latent / single_latent / double_latent
+# 因此 prompt 必须同时允许 0 / 1 / 多次 latent 触发。
 NLD_SYSTEM_PROMPT = """You are a visual reasoning assistant. Analyze images carefully and think deeply.
 
 Rules:
-1. Describe your reasoning process clearly and concisely.
-2. When you need to perform high-level visual thinking — such as mentally reconstructing 3D layouts from 2D views, reasoning about spatial relationships, simulating physical dynamics, resolving occlusions, or imagining counterfactual scenes — output <|latent|> to enter deep visual reasoning in latent space.
-3. When your latent reasoning is complete, output <|/latent|> to exit latent space and continue generating.
-4. After latent reasoning, continue with your conclusion grounded in the visual evidence.
-5. End with "Final Answer:" on its own line, followed by your final answer.
+1. Describe your reasoning process clearly and concisely, grounded in the visual evidence.
+2. When you need to perform high-level visual thinking — such as mentally reconstructing 3D layouts from 2D views, reasoning about spatial relationships, simulating physical dynamics, resolving occlusions, or imagining counterfactual scenes — output <|latent|> to enter deep visual reasoning in latent space, and <|/latent|> to exit.
+3. You may trigger <|latent|> ... <|/latent|> zero, one, or multiple times during reasoning. If the question can be answered directly from the image without deep mental simulation, skip latent reasoning entirely. If it requires multiple distinct mental operations (e.g. compare two viewpoints, or trace before/after states), trigger latent reasoning once per operation.
+4. After each latent block, continue in natural language, grounding the latent result in the visual evidence.
+5. End your response with "Final Answer:" on its own line, followed by your final answer.
 
-Example:
+Example A (no latent, direct observation):
+The image shows a red sedan parked beside a green bench under a tree. The sedan has four doors and tinted windows. No mental simulation is needed to describe the visible scene.
+Final Answer:
+A red four-door sedan is parked next to a green bench beneath a tree.
+
+Example B (single latent, one mental simulation):
 The scene shows a ball mid-flight toward a glass window. To predict the outcome, I need to mentally simulate the collision dynamics and trace the impact geometry. <|latent|> <|/latent|> Based on the trajectory angle and estimated velocity, the ball will shatter the lower-left pane on impact, sending glass fragments inward in a cone pattern.
 Final Answer:
-The ball will break through the lower-left window pane, scattering glass fragments inward."""
+The ball will break through the lower-left window pane, scattering glass fragments inward.
+
+Example C (double latent, two mental simulations):
+Two people stand on opposite sides of a chess board. To compare their perspectives, I first reconstruct what the left player sees. <|latent|> <|/latent|> From the left, the white pieces are in the foreground and the board tilts away. Now I switch to the right player's viewpoint. <|latent|> <|/latent|> From the right, the black pieces dominate the foreground with the board tilting in the opposite direction. The two players see mirror-opposite layouts.
+Final Answer:
+Each player sees the board tilted away from them with their own pieces in the foreground, producing mirror-opposite perspectives."""
 
 
 class NLDDataset(Dataset):
@@ -136,26 +149,42 @@ class NLDDataset(Dataset):
         
         for item in raw_data:
             # 检查必要字段
-            # 优先使用 'image' 字段 (短相对路径如 vcr1images/xxx.jpg)
-            # 'image_path' 字段已含 data/nld_phase1/raw/vcr/ 前缀，与 image_base_dir 拼接会导致双重路径
-            img = item.get('image') or item.get('image_path', '')
-            if not img:
-                no_image_count += 1
-                continue
-            
-            # 拼接图片路径
-            if self.image_base_dir and not os.path.isabs(img):
-                full_path = os.path.join(self.image_base_dir, img)
+            # 支持三种图片字段格式:
+            #   1. 'image_paths': List[str] (多图, VSI-Bench 等)
+            #   2. 'image': str (短相对路径如 vcr1images/xxx.jpg)
+            #   3. 'image_path': str (含前缀的相对路径)
+            img_paths_raw = item.get('image_paths')  # 多图列表
+            if isinstance(img_paths_raw, list) and img_paths_raw:
+                # 多图模式: 解析所有路径
+                resolved_paths = []
+                for p in img_paths_raw:
+                    if self.image_base_dir and not os.path.isabs(p):
+                        resolved_paths.append(os.path.join(self.image_base_dir, p))
+                    else:
+                        resolved_paths.append(p)
+                item['_resolved_image_paths'] = resolved_paths
+                item['_resolved_image_path'] = resolved_paths[0]  # 兼容旧逻辑
+                check_path = resolved_paths[0]
             else:
-                full_path = img
-            item['_resolved_image_path'] = full_path
+                # 单图模式 (兼容旧格式)
+                img = item.get('image') or item.get('image_path', '')
+                if not img:
+                    no_image_count += 1
+                    continue
+                if self.image_base_dir and not os.path.isabs(img):
+                    full_path = os.path.join(self.image_base_dir, img)
+                else:
+                    full_path = img
+                item['_resolved_image_path'] = full_path
+                item['_resolved_image_paths'] = [full_path]  # 统一为列表
+                check_path = full_path
             
             # 检查 reasoning_for_training 字段
             if not item.get('reasoning_for_training', '').strip():
                 no_reasoning_count += 1
                 continue
             
-            if not skip_image_check and not os.path.exists(full_path):
+            if not skip_image_check and not os.path.exists(check_path):
                 invalid_count += 1
                 continue
             
@@ -262,7 +291,13 @@ class NLDDataset(Dataset):
     def _get_item_inner(self, idx):
         item = self.data[idx]
 
-        image_path = item.get('_resolved_image_path', item.get('image', item.get('image_path', '')))
+        # 多图兼容: 优先使用 _resolved_image_paths (列表)
+        image_paths = item.get('_resolved_image_paths', None)
+        if not image_paths:
+            # fallback 到单图
+            single = item.get('_resolved_image_path', item.get('image', item.get('image_path', '')))
+            image_paths = [single] if single else []
+        
         question = item.get('question', '')
         answer = item.get('answer', '')
         reasoning = item.get('reasoning_for_training', '')
@@ -284,10 +319,11 @@ class NLDDataset(Dataset):
                 "content": [{"type": "text", "text": self.system_prompt}],
             })
 
-        # 用户消息: 图像 + 问题
+        # 用户消息: 多图 + 问题 (兼容单图和多图)
         user_content = []
-        if image_path:
-            user_content.append({"type": "image", "image": image_path})
+        for img_path in image_paths:
+            if img_path:
+                user_content.append({"type": "image", "image": img_path})
         user_content.append({"type": "text", "text": question})
         messages.append({"role": "user", "content": user_content})
 
@@ -384,6 +420,27 @@ class NLDDataset(Dataset):
             answer_ids.clone(),                   # "\nFinal Answer:\n{answer}<|im_end|>": 监督 ✅
         ], dim=0)
 
+        # ---- 5.1 Mask 紧跟 <|latent|> 的 <|/latent|> 位置 (修复 hidden 坍塌驱动力) ----
+        # 设计动机:
+        #   原训练序列 "... <|latent|> <|/latent|> ..." 中，<|latent|> 位置的 next-token CE
+        #   监督目标恒为 <|/latent|>，导致:
+        #     1) lm_head[<|/latent|>] 在 <|latent|> 位置被强力推高 (双重监督, 与 exit_token_loss 重叠)
+        #     2) 残差链反向传导: 第一步 thought_hidden 也被推向 "看起来像 <|/latent|>" → hidden 坍塌
+        #     3) 失去 "由 thought hidden 最后一步决定何时退出" 的 latent reasoning 本意
+        #
+        #   修复: 把紧跟在 <|latent|> 之后的 <|/latent|> token 的 label 设为 -100,
+        #         让 <|/latent|> 的预测仅由 latent_thinker 的 exit_token_loss 监督
+        #         (这是 thought hidden 最后一步的产物, 才是 "用思考决定退出" 的正确学习路径).
+        #
+        #   注意: 我们仅 mask "紧跟 <|latent|>" 的那个 <|/latent|>;
+        #         不影响 reasoning 中其他 (理论上不应存在的) 独立 <|/latent|>.
+        for pos in latent_positions_in_reasoning:
+            # reasoning_ids 中 pos+1 位置应是 <|/latent|>
+            if pos + 1 < len(reasoning_ids) and \
+               int(reasoning_ids[pos + 1].item()) == self.latent_end_token_id:
+                # 在拼好的 labels 中, 该 <|/latent|> 的绝对位置 = prompt_len + (pos+1)
+                labels[prompt_len + pos + 1] = -100
+
         # ---- 6. Loss weight mask (answer 加权) ----
         reasoning_len = len(reasoning_ids)
         answer_len_val = len(answer_ids)
@@ -402,34 +459,85 @@ class NLDDataset(Dataset):
         # 只有 <|latent|> 位置触发隐空间推理，Final Answer 后不触发
         step_positions = [pos + prompt_len for pos in latent_positions_in_reasoning]
 
-        # ---- 8. 从 latent_key_tokens 获取每个 <|latent|> 的隐空间迭代步数 ----
-        # latent_key_tokens 是一个 list of stages，每个 stage 对应一个认知阶段
-        # 隐空间迭代步数 = stage 数量 (不同数据的 stage 数不同)
-        latent_key_tokens = item.get('latent_key_tokens', [])
-        num_stages = item.get('num_stages', len(latent_key_tokens) if latent_key_tokens else 0)
-        # 为每个 <|latent|> 触发点分配迭代步数
-        # 当前数据中每条只有 1 个 <|latent|>，所以 latent_think_steps 是一个列表
-        # 如果没有 stage 信息，默认使用 0 (由模型的 max_think_steps 兜底)
-        latent_think_steps = [num_stages] * len(latent_positions_in_reasoning) if num_stages > 0 else []
+        # ---- 8. 从 latent_key_tokens 获取每个 <|latent|> 触发点的隐空间迭代步数 ----
+        # 新契约 (v6.2 per-boundary): latent_key_tokens 是 List[List[Dict]]
+        #   外层 = 每个 <|latent|> 触发点, 内层 = 该触发点的 stage 列表.
+        #   该 boundary 的隐空间迭代步数 = len(boundary_stages).
+        # 兼容旧契约 (单触发点): latent_key_tokens = List[Dict]; 自动包一层 -> 单 boundary.
+        latent_key_tokens_raw = item.get('latent_key_tokens', [])
+        per_boundary_stages: list = []
+        if isinstance(latent_key_tokens_raw, list) and latent_key_tokens_raw:
+            first = latent_key_tokens_raw[0]
+            if isinstance(first, list):
+                # 新契约: per-boundary 嵌套
+                per_boundary_stages = latent_key_tokens_raw
+            elif isinstance(first, dict):
+                # 旧契约: 单触发点 (所有 stages 共享一个 <|latent|>)
+                per_boundary_stages = [latent_key_tokens_raw]
+            else:
+                per_boundary_stages = []
 
-        # ---- 9. Stage Concept Tokens: 将 latent_key_tokens 的关键词 tokenize ----
-        # 每个 stage 的关键词 tokens 会被 tokenize，用于 Stage-Aligned Concept Supervision
-        # 格式: List[List[int]] — 每个 stage 对应一个 token id 列表
-        stage_concept_token_ids = []
-        if latent_key_tokens:
-            for stage_info in latent_key_tokens:
-                # 将该 stage 的所有关键词拼接为一个字符串，然后 tokenize
+        # latent_think_steps[i] = 第 i 个 boundary 的 stage 数
+        # 长度对齐: 若 boundary 数 != latent_positions_in_reasoning 数, 截断或用 0 填充
+        latent_think_steps: list = []
+        for b_idx in range(len(latent_positions_in_reasoning)):
+            if b_idx < len(per_boundary_stages):
+                latent_think_steps.append(len(per_boundary_stages[b_idx]))
+            else:
+                latent_think_steps.append(0)
+        # num_stages 仍保留为顶层"总 stage 数"用于元统计 (训练逻辑不再依赖)
+        num_stages = sum(latent_think_steps) if latent_think_steps else 0
+
+        # ---- 9. Stage Concept Tokens: 将每个 boundary 的每个 stage 的关键词 tokenize ----
+        # 输出格式 (v6.2): List[List[List[int]]] = [boundary][stage][token_ids].
+        # model_v2 的 boundary 循环中, 按 thought_count 切片传给 thinker.
+        #
+        # 关键设计 (复用旧 stage 级解析逻辑):
+        #   1. 每个 keyword 独立 tokenize, 避免分隔符 ", " 的 token 被错误纳入;
+        #   2. 同时加入 "keyword" 和 " keyword" 两种 BPE 形式;
+        #   3. 去重 + 按 id 排序;
+        #   4. 跳过空白 keyword.
+        # 同步提取 stage role (用于视觉侧 path B2 的 slerp alpha 调度).
+        stage_concept_token_ids: list = []
+        stage_concept_roles: list = []
+        for boundary_stages in per_boundary_stages:
+            this_boundary: list = []
+            this_boundary_roles: list = []
+            for stage_info in boundary_stages:
+                if not isinstance(stage_info, dict):
+                    continue
                 keywords = stage_info.get('tokens', [])
-                if keywords:
-                    keyword_text = ', '.join(keywords)
-                    token_ids = self.processor.tokenizer(
-                        keyword_text,
+                token_id_set = set()
+                for kw in keywords:
+                    if not isinstance(kw, str):
+                        continue
+                    kw_stripped = kw.strip()
+                    if not kw_stripped:
+                        continue
+                    # 形式 A: 原始 keyword (句首 / 独立出现场景)
+                    ids_a = self.processor.tokenizer(
+                        kw_stripped,
                         add_special_tokens=False,
                         return_tensors=None,
                     )['input_ids']
-                    stage_concept_token_ids.append(token_ids)
-                else:
-                    stage_concept_token_ids.append([])
+                    if ids_a:
+                        token_id_set.update(ids_a)
+                    # 形式 B: 带前导空格 keyword (Qwen BPE 不同 id)
+                    ids_b = self.processor.tokenizer(
+                        ' ' + kw_stripped,
+                        add_special_tokens=False,
+                        return_tensors=None,
+                    )['input_ids']
+                    if ids_b:
+                        token_id_set.update(ids_b)
+                this_boundary.append(sorted(token_id_set))
+                # role: abstract / bridge / unified / concrete (来自 schema_v6 切分逻辑)
+                _role = stage_info.get('role')
+                this_boundary_roles.append(
+                    str(_role).lower().strip() if isinstance(_role, str) else None
+                )
+            stage_concept_token_ids.append(this_boundary)
+            stage_concept_roles.append(this_boundary_roles)
 
         # pixel_values 和 image_grid_thw
         pixel_values = prompt_inputs.get('pixel_values')
@@ -453,6 +561,7 @@ class NLDDataset(Dataset):
             "answer_weight": float(answer_weight),
             "num_stages": num_stages,
             "stage_concept_token_ids": stage_concept_token_ids,
+            "stage_concept_roles": stage_concept_roles,
         }
 
 
@@ -529,9 +638,13 @@ class NLDCollator:
         # 每个样本的 latent_think_steps (per-boundary 的隐空间迭代步数)
         latent_think_steps = [item.get('latent_think_steps', []) for item in batch]
 
-        # Stage Concept Token IDs: 每个样本的每个 stage 的关键词 token ids
-        # 格式: List[List[List[int]]] — [batch][stage][token_ids]
+        # Stage Concept Token IDs: 每个样本的每个 boundary 的每个 stage 的关键词 token ids
+        # 格式 (v6.2): List[List[List[List[int]]]] — [batch][boundary][stage][token_ids]
+        # model_v2 的 boundary 循环中, 按 thought_count 切片到 [batch][stage][token_ids]
+        # 再传给 thinker (向后兼容 thinker 旧的 3 维签名).
         stage_concept_token_ids = [item.get('stage_concept_token_ids', []) for item in batch]
+        # path B2 视觉侧: 与 stage_concept_token_ids 同构, 内层为 role 字符串 (or None)
+        stage_concept_roles = [item.get('stage_concept_roles', []) for item in batch]
 
         # 样本级元信息
         sample_meta = {
@@ -554,5 +667,6 @@ class NLDCollator:
             "prompt_lens": prompt_lens,
             "loss_weight_mask": loss_weight_mask,
             "stage_concept_token_ids": stage_concept_token_ids,
+            "stage_concept_roles": stage_concept_roles,
             "sample_meta": sample_meta,
         }

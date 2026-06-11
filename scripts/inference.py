@@ -105,7 +105,14 @@ class NLDInference:
         temperature: float = 0.7,
         top_p: float = 0.9,
         do_sample: bool = True,
-    ) -> str:
+        # ---- LatentDraft 默认推理时行为: 病态 fallback (默认开启) ----
+        # 一旦第一次推理命中 hit_max / 没有 'Final Answer:' / 重复 ngram,
+        # 就用 directly-answer prompt + 强制 'Final Answer: ' 前缀重跑一次,
+        # 这是 LatentDraft 推理时的 *默认* 兜底逻辑.
+        enable_fallback: bool = True,
+        fallback_max_new_tokens: int = 32,
+        return_meta: bool = False,
+    ):
         """
         单张图像推理
         
@@ -116,9 +123,14 @@ class NLDInference:
             temperature: 温度参数
             top_p: Top-p 采样参数
             do_sample: 是否采样
-        
+            enable_fallback: True (默认) -> 第一次出现 hit_max / no Final Answer
+                            / ngram 重复时, 自动用 directly-answer prompt 重跑.
+            fallback_max_new_tokens: fallback 时的 max_new_tokens, 默认 32.
+            return_meta: True 时返回 (answer, meta_dict) 而非纯字符串, meta
+                        含 fallback_triggered/fallback_reason/timings 等.
+
         Returns:
-            answer: 生成的回答文本
+            answer: 生成的回答文本 (return_meta=True 时返回 (answer, meta))
         """
         # 构造消息
         messages = []
@@ -132,54 +144,40 @@ class NLDInference:
             {"type": "text", "text": question},
         ]})
 
-        # 处理输入
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        # 统一推理 + 兜底入口 (LatentDraft 默认行为)
+        from rld.inference_utils import (
+            infer_with_latent_fallback,
+            split_reasoning_and_answer,
         )
-        if process_vision_info:
-            image_inputs, _ = process_vision_info(messages)
-        else:
-            image_inputs = None
-
-        inputs = self.processor(
-            text=[text],
-            images=image_inputs,
-            return_tensors="pt",
-        ).to(self.device)
-
-        # 生成
-        generated_ids = self.model.generate(
-            pixel_values=inputs['pixel_values'],
-            image_grid_thw=inputs['image_grid_thw'],
-            input_ids=inputs['input_ids'],
-            attention_mask=inputs['attention_mask'],
+        out = infer_with_latent_fallback(
+            self.model, self.processor, messages,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
             do_sample=do_sample,
+            enable_fallback=enable_fallback,
+            fallback_max_new_tokens=fallback_max_new_tokens,
+            device=self.device,
         )
-
-        # 解码 (只取生成部分)
-        prompt_len = inputs['input_ids'].shape[1]
-        generated_tokens = generated_ids[0, prompt_len:]
-        full_output = self.processor.tokenizer.decode(
-            generated_tokens, skip_special_tokens=False
-        )
-
         # 后处理: 用 "Final Answer:" 分割 reasoning 和 answer
-        # 生成内容格式: "{reasoning}<|latent|>{conclusion}\nFinal Answer:\n{answer}<|im_end|>"
-        # 清理 <|latent|> token (隐空间思考标记，不显示)
-        full_output = full_output.replace(LATENT_TOKEN, " [latent thinking] ")
-        
-        if "Final Answer:" in full_output:
-            fa_idx = full_output.rfind("Final Answer:")
-            reasoning_part = full_output[:fa_idx].strip()
-            answer_part = full_output[fa_idx + len("Final Answer:"):].strip()
-            answer = answer_part.replace("<|im_end|>", "").strip()
-        else:
-            # 模型未输出 "Final Answer:"，取全部输出作为答案
-            answer = full_output.replace("<|im_end|>", "").strip()
+        # (helper 返回的 out['text'] 已经做过 [latent thinking] 替换 + 去 EOS)
+        _reasoning, answer = split_reasoning_and_answer(out['text'])
+        if not answer:
+            # 没出现 'Final Answer:' (例如 fallback 也只回了一行字), 整段就是答案
+            answer = out['text'].strip()
 
+        if return_meta:
+            meta = {
+                'fallback_triggered': out['fallback_triggered'],
+                'fallback_reason': out['fallback_reason'],
+                'first_num_new_tokens': out['first_num_new_tokens'],
+                'fallback_num_new_tokens': out['fallback_num_new_tokens'],
+                'gen_time_first_s': out['gen_time_first_s'],
+                'gen_time_fallback_s': out['gen_time_fallback_s'],
+                'gen_time_total_s': out['gen_time_total_s'],
+                'first_text': out['first_text'],
+            }
+            return answer, meta
         return answer
 
     def batch_infer(

@@ -1,0 +1,118 @@
+# ============================================================
+#  RLD Stage-2 SW-SRS · ERQA+VSI-Bench · ckpt-1200 起点 训练配置
+#  ----------------------------------------------------------
+#  目标:
+#    - 从 outputs/rld_stage2_swsrs_v6b1b2b3_ckpt200/checkpoint-1200 继续训练
+#    - 使用 ERQA(400) + VSI-Bench(1162) = 1562 条混合数据
+#    - 训练 1 个 epoch
+#    - 支持多图输入 (VSI-Bench 8帧/条)
+#
+#  数据:
+#    data/erqa_vsibench_merged/erqa_vsibench_merged_1562.json (1562 samples)
+#    - ERQA: 400 条 (单图, spatial_relation 等)
+#    - VSI-Bench: 1162 条 (多图 8帧, perspective/route_planning)
+#
+#  起点 (resume_from_model_only):
+#    outputs/rld_stage2_swsrs_v6b1b2b3_ckpt200/checkpoint-1200
+#    - 上一轮 v6 b1b2b3 训练 2 epochs 的最终产物
+# ============================================================
+
+# ============================================================
+# 基座模型
+# ============================================================
+model:
+  model_path: "/mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/for_lucas_Qwen3-VL-8B-Instruct_export"
+  hidden_size: 4096
+  total_layers: 36
+  torch_dtype: "bfloat16"
+  attn_implementation: "flash_attention_2"
+
+# ============================================================
+# NativeLatentThinker
+# ============================================================
+nld:
+  max_think_steps: 8
+  think_layer_start: 0
+  think_layer_end: 36
+  saturation_exit_threshold: 0.99
+
+  # SW-SRS loss 权重
+  key_token_weight: 1.0
+
+  # Anti-Collapse (保持关闭, 沿用上一轮设置)
+  exit_margin: 2.0
+  exit_margin_weight: 0.0
+  exit_margin_loss_weight: 0.0
+
+  sw_srs_alpha: 0.7
+  swsrs_anti_collapse_margin: 0.5
+  swsrs_anti_collapse_weight: 0.0
+  swsrs_anti_collapse_loss_weight: 0.0
+
+  diversity_threshold: 0.95
+  diversity_weight: 0.0
+  diversity_loss_weight: 0.0
+
+  # Vision loss (过渡模态几何约束, 沿用上一轮设置)
+  vision_loss_weight: 1.0
+  vision_loss_total_weight: 1.0
+  vision_top_k: 6
+  vision_margin: 0.05
+
+  # 从 ckpt-1200 加载模型权重
+  resume_from_model_only: "/mnt/cephszjt/user_juntianzhang/LatentDraft/outputs/rld_stage2_swsrs_v6b1b2b3_ckpt200/checkpoint-1200"
+
+# ============================================================
+# 数据 (ERQA + VSI-Bench 混合, 1562 samples)
+# ============================================================
+data:
+  train_json: "/mnt/cephszjt/user_juntianzhang/LatentDraft/data/erqa_vsibench_merged/erqa_vsibench_merged_1562.json"
+  image_base_dir: "/mnt/cephszjt/user_juntianzhang/LatentDraft"
+  skip_image_check: true
+  min_pixels: 3136             # 56x56 最小
+  max_pixels: 1048576          # 1024x1024 最大
+  max_seq_len: 8192
+  use_system_prompt: true
+
+# ============================================================
+# 训练
+# ============================================================
+training:
+  output_dir: "./outputs/rld_stage2_erqa_vsibench_ckpt1200"
+
+  # FSDP
+  fsdp: "full_shard auto_wrap"
+  fsdp_config: "configs/fsdp_config.json"
+
+  # 训练规模估算 (1 epoch):
+  #   1562 samples / (bs=1 * grad_accum=4 * 8 GPU) ≈ 49 effective steps/epoch
+  #   1 epoch ≈ 49 steps
+  num_epochs: 1
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 4
+  gradient_checkpointing: false
+
+  # 学习率 (继续训练, 适当降低 lr)
+  learning_rate: 2.0e-6
+  thinker_lr: 1.0e-5
+  vlm_lr: 2.0e-6
+
+  weight_decay: 0.01
+  warmup_steps: 5
+  lr_scheduler_type: "cosine"
+  max_grad_norm: 0.5
+
+  # Logging / checkpoint
+  logging_steps: 5
+  monitor_every_n_steps: 10
+  save_steps: 25
+  save_total_limit: 4
+  eval_steps: 500
+  num_workers: 4
+  report_to: ["tensorboard"]
+
+# ============================================================
+# 随机种子
+# ============================================================
+seed: 42
