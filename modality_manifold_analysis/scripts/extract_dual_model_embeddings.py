@@ -18,7 +18,7 @@ extract_dual_model_embeddings.py
 用法 (Docker GPU):
   python3 extract_dual_model_embeddings.py \
       --ckpt1200_path /path/to/checkpoint-1200 \
-      --baseline_path /mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/for_lucas_Qwen3-VL-8B-Instruct_export \
+      --baseline_path <PATH_TO_QWEN3_VL_8B_INSTRUCT> \
       --output_dir ./modality_manifold_analysis/results \
       --n_samples 100
 """

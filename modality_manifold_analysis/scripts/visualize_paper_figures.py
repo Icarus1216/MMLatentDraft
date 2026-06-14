@@ -778,13 +778,13 @@ Effective dim($\mathbf{H}$) & %.1f & \textbf{%.1f} & +%.1f \\
 def main():
     parser = argparse.ArgumentParser(description='Generate paper figures for modality manifold analysis')
     parser.add_argument('--results_dir', type=str, 
-                       default='/mnt/cephszjt/user_juntianzhang/LatentDraft/modality_manifold_analysis/results_v3',
+                       default='./modality_manifold_analysis/results_v3',
                        help='Directory containing metrics and embeddings')
     parser.add_argument('--subspace_dir', type=str, 
-                       default='/mnt/cephszjt/user_juntianzhang/LatentDraft/modality_manifold_analysis/results_subspace',
+                       default='./modality_manifold_analysis/results_subspace',
                        help='Directory containing subspace analysis results')
     parser.add_argument('--output_dir', type=str, 
-                       default='/mnt/cephszjt/user_juntianzhang/LatentDraft/modality_manifold_analysis/paper_figures',
+                       default='./modality_manifold_analysis/paper_figures',
                        help='Output directory for paper figures')
     args = parser.parse_args()
     

@@ -18,7 +18,7 @@ echo ""
 # ======================== 默认参数 ========================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-MODEL_PATH="/mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/for_lucas_Qwen3-VL-8B-Instruct_export"
+MODEL_PATH="<PATH_TO_QWEN3_VL_8B_INSTRUCT>"
 NLD_CHECKPOINT="./outputs/nld_train/model"
 DEVICE="cuda"
 

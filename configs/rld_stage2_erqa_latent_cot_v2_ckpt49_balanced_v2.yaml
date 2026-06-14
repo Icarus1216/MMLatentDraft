@@ -18,7 +18,7 @@
 # 基座模型
 # ============================================================
 model:
-  model_path: "/mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/for_lucas_Qwen3-VL-8B-Instruct_export"
+  model_path: "<PATH_TO_QWEN3_VL_8B_INSTRUCT>"
   hidden_size: 4096
   total_layers: 36
   torch_dtype: "bfloat16"
@@ -57,14 +57,14 @@ nld:
   vision_margin: 0.05
 
   # 从 ckpt-49 (balanced v2版) 加载模型权重
-  resume_from_model_only: "/mnt/cephszjt/user_juntianzhang/LatentDraft/outputs/rld_stage2_erqa_vsibench_ckpt49_balanced_v2/checkpoint-49"
+  resume_from_model_only: "./outputs/rld_stage2_erqa_vsibench_ckpt49_balanced_v2/checkpoint-49"
 
 # ============================================================
 # 数据 (ERQA latent_cot_v2)
 # ============================================================
 data:
-  train_json: "/mnt/cephszjt/user_juntianzhang/LatentDraft/data/erqa/erqa_latent_cot_v2.json"
-  image_base_dir: "/mnt/cephszjt/user_juntianzhang/LatentDraft"
+  train_json: "./data/erqa/erqa_latent_cot_v2.json"
+  image_base_dir: ""
   skip_image_check: true
   min_pixels: 3136
   max_pixels: 1048576

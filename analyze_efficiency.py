@@ -561,7 +561,7 @@ def plot_efficiency_comparison(summary, output_dir):
 def main():
     parser = argparse.ArgumentParser(description="FLOPs & Latency 效率分析: 模型配置对比")
     parser.add_argument("--model_path", type=str,
-                        default="/mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/for_lucas_Qwen3-VL-8B-Instruct_export",
+                        default="<PATH_TO_QWEN3_VL_8B_INSTRUCT>",
                         help="Qwen3-VL-8B-Instruct 基座模型路径")
     parser.add_argument("--checkpoint", type=str, default=None, required=True,
                         help="LatentDraft checkpoint 路径 (必须)")
@@ -571,7 +571,7 @@ def main():
     parser.add_argument("--max_samples", type=int, default=200, help="0=全量")
     parser.add_argument("--max_new_tokens", type=int, default=2048)
     parser.add_argument("--thinking_model_path", type=str,
-                        default="/mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/Qwen_Qwen3-VL-8B-Thinking",
+                        default="<PATH_TO_QWEN3_VL_8B_THINKING>",
                         help="Qwen3-VL-8B-Thinking 模型路径 (不带 latent 的 CoT 基线)")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--device", type=str, default="cuda")

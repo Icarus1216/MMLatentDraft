@@ -33,7 +33,7 @@ import glob
 from collections import defaultdict
 from typing import Dict, List, Optional
 
-DATA_ROOT = "/mnt/cephszjt/user_juntianzhang/LatentDraft/data"
+DATA_ROOT = "./data"
 EXPORT_ROOT = f"{DATA_ROOT}/v6_seeds_multisource"
 
 # ----------------- task_type 映射 -----------------
@@ -436,7 +436,7 @@ def build_vcr_seeds(n: int, rng: random.Random,
             continue
         # 路径如果是相对路径, 补全为绝对
         if not os.path.isabs(img):
-            img = f"/mnt/cephszjt/user_juntianzhang/LatentDraft/{img}" if not img.startswith("/") else img
+            img = f"./{img}" if not img.startswith("/") else img
         sid = s.get("image", "")
         if sid in exclude_ids:
             excluded += 1

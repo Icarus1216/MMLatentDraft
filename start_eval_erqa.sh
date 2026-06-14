@@ -25,7 +25,7 @@ echo "📊 ERQA 全数据集纯推理测试"
 echo ""
 
 # ======================== 配置 ========================
-MODEL_PATH="/mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/for_lucas_Qwen3-VL-8B-Instruct_export"
+MODEL_PATH="<PATH_TO_QWEN3_VL_8B_INSTRUCT>"
 NLD_CHECKPOINT="./outputs/rld_stage2/checkpoint-400"
 DATA_FILE="./data/erqa/erqa_test.jsonl"
 DATA_ROOT="./data/erqa"

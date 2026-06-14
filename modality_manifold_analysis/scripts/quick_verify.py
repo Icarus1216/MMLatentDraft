@@ -2,13 +2,13 @@
 """快速验证 H 在训练过程中的模态位置变化"""
 import json, numpy as np
 
-RESULTS = '/mnt/cephszjt/user_juntianzhang/LatentDraft/modality_manifold_analysis/results'
+RESULTS = './modality_manifold_analysis/results'
 
 with open(f'{RESULTS}/training_metrics.json') as f:
     data = json.load(f)
 with open(f'{RESULTS}/training_phase_summary.json') as f:
     phases = json.load(f)
-with open('/mnt/cephszjt/user_juntianzhang/LatentDraft/outputs/modality_geometry_v2/geometry_metrics.json') as f:
+with open('./outputs/modality_geometry_v2/geometry_metrics.json') as f:
     baseline = json.load(f)
 
 cos_hv = [v for v in data['cos_hv__mean'] if v is not None]

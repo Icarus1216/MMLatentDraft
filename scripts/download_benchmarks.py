@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-批量下载 VLM benchmark 到 /mnt/cephszjt/user_juntianzhang/LatentDraft/data/
+批量下载 VLM benchmark 到 ./data/
 
 已支持:
 - MMStar         → Lin-Chen/MMStar
@@ -28,7 +28,7 @@ from pathlib import Path
 # ---- 关键：在 import huggingface_hub 之前强制重定向 HF cache ----
 # 默认 ~/.cache/huggingface 可能被 root 占用无写权限，必须重定向到用户可写目录。
 # 即使下载时用 local_dir，hub/xet 后端仍会尝试写 cache 元数据/日志。
-_HF_USER_CACHE = "/mnt/cephszjt/user_juntianzhang/LatentDraft/outputs/.hf_cache"
+_HF_USER_CACHE = "./outputs/.hf_cache"
 os.environ.setdefault("HF_HOME", _HF_USER_CACHE)
 os.environ.setdefault("HF_HUB_CACHE", os.path.join(_HF_USER_CACHE, "hub"))
 os.environ.setdefault("HF_DATASETS_CACHE", os.path.join(_HF_USER_CACHE, "datasets"))
@@ -47,7 +47,7 @@ os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
 from huggingface_hub import snapshot_download
 from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError
 
-DATA_ROOT = "/mnt/cephszjt/user_juntianzhang/LatentDraft/data"
+DATA_ROOT = "./data"
 
 # (local_dir_name, [candidate_repo_ids])
 BENCHMARKS = [

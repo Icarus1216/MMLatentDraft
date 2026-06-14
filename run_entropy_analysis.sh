@@ -10,7 +10,7 @@ set -e
 # ======================== 默认参数 ========================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-MODEL_PATH="/mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/for_lucas_Qwen3-VL-8B-Instruct_export"
+MODEL_PATH="<PATH_TO_QWEN3_VL_8B_INSTRUCT>"
 CHECKPOINT="${SCRIPT_DIR}/outputs/rld_stage2_erqa_latent_cot_v2_ckpt49_balanced_v2/checkpoint-26"
 DATA_FILE="${SCRIPT_DIR}/data/erqa/erqa_test.jsonl"
 DATA_ROOT="${SCRIPT_DIR}/data/erqa"

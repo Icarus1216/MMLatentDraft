@@ -782,7 +782,7 @@ def visualize_results(results_A, results_B, output_dir):
 def main():
     parser = argparse.ArgumentParser(description='正交分解 & 子空间主角分析')
     parser.add_argument('--results_dir', type=str, 
-                       default='/mnt/cephszjt/user_juntianzhang/LatentDraft/modality_manifold_analysis/results_v3',
+                       default='./modality_manifold_analysis/results_v3',
                        help='包含 embeddings_baseline.pt 和 embeddings_ckpt.pt 的目录')
     parser.add_argument('--output_dir', type=str, default=None,
                        help='输出目录 (默认: results_dir/subspace_analysis)')

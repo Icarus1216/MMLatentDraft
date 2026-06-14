@@ -173,7 +173,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Plot efficiency comparison (ACL style)")
     parser.add_argument("--summary", default="./outputs/efficiency_analysis/summary_stats.json",
                         help="Path to summary_stats.json")
-    parser.add_argument("--out_dir", default="/mnt/cephszjt/user_juntianzhang/LatentDraft/paper_tables_figures",
+    parser.add_argument("--out_dir", default="./paper_tables_figures",
                         help="Output directory for the figure")
     parser.add_argument("--dpi", type=int, default=300, help="Figure DPI")
     parser.add_argument("--latent_flops", type=float, default=None,

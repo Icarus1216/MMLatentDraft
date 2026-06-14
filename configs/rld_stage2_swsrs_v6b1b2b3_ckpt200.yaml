@@ -31,7 +31,7 @@
 # 基座模型
 # ============================================================
 model:
-  model_path: "/mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/for_lucas_Qwen3-VL-8B-Instruct_export"
+  model_path: "<PATH_TO_QWEN3_VL_8B_INSTRUCT>"
   hidden_size: 4096
   total_layers: 36
   torch_dtype: "bfloat16"
@@ -110,14 +110,14 @@ nld:
   vision_margin: 0.05                     # 双 anchor margin 的 δ (默认 0.05)
 
   # ⭐ 仅加载模型权重 (不走 HF Trainer 原生 resume)
-  resume_from_model_only: "/mnt/cephszjt/user_juntianzhang/LatentDraft/outputs/rld_stage2/checkpoint-200"
+  resume_from_model_only: "./outputs/rld_stage2/checkpoint-200"
 
 # ============================================================
 # 数据 (v6 b1+b2+b3 fixed, 19195 samples)
 # ============================================================
 data:
-  train_json: "/mnt/cephszjt/user_juntianzhang/LatentDraft/data/v6/v6_b1b2b3_merged_training_slim_vsp_fixed.json"
-  image_base_dir: "/mnt/cephszjt/user_juntianzhang/LatentDraft"
+  train_json: "./data/v6/v6_b1b2b3_merged_training_slim_vsp_fixed.json"
+  image_base_dir: ""
   skip_image_check: true
   min_pixels: 3136             # 56x56 最小
   max_pixels: 1048576          # 1024x1024 最大

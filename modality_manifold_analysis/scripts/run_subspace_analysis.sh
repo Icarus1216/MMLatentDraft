@@ -12,7 +12,7 @@
 
 set -e
 
-PROJ_ROOT="/mnt/cephszjt/user_juntianzhang/LatentDraft"
+PROJ_ROOT=""
 ANALYSIS_DIR="${PROJ_ROOT}/modality_manifold_analysis"
 SCRIPT="${ANALYSIS_DIR}/scripts/orthogonal_decomposition_analysis.py"
 

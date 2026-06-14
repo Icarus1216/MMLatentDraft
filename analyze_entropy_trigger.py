@@ -1402,7 +1402,7 @@ def compute_statistics(per_sample_data):
 def main():
     parser = argparse.ArgumentParser(description="Latent 触发位置与 Token 熵的关系分析")
     parser.add_argument("--model_path", type=str,
-                        default="/mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/for_lucas_Qwen3-VL-8B-Instruct_export")
+                        default="<PATH_TO_QWEN3_VL_8B_INSTRUCT>")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="LatentDraft 模型 checkpoint 路径")
     parser.add_argument("--data_file", type=str, default="./data/erqa/erqa_test.jsonl")

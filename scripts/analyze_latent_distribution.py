@@ -8,8 +8,8 @@ analyze_latent_distribution.py
 
 用法:
     python scripts/analyze_latent_distribution.py \
-        --input /mnt/cephszjt/user_juntianzhang/LatentDraft/data/v6/v6_b1b2b3_merged_training_slim_vsp_fixed.json \
-        --output /mnt/cephszjt/user_juntianzhang/LatentDraft/paper_tables_figures/latent_trigger_distribution.pdf
+        --input ./data/v6/v6_b1b2b3_merged_training_slim_vsp_fixed.json \
+        --output ./paper_tables_figures/latent_trigger_distribution.pdf
 """
 
 import argparse
@@ -224,7 +224,7 @@ def main():
     parser.add_argument(
         "--output",
         type=str,
-        default="/mnt/cephszjt/user_juntianzhang/LatentDraft/paper_tables_figures/latent_trigger_distribution.pdf",
+        default="./paper_tables_figures/latent_trigger_distribution.pdf",
         help="输出 PDF 路径",
     )
     parser.add_argument(

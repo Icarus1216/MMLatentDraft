@@ -70,7 +70,7 @@ except ImportError:
 # ==================================================================
 # 0. 默认路径
 # ==================================================================
-DEFAULT_MODEL_PATH = "/mnt/wfs/mmchongqingssdwfssz/project_luban_infra/luban_infra/model_factory/for_lucas_Qwen3-VL-8B-Instruct_export"
+DEFAULT_MODEL_PATH = "<PATH_TO_QWEN3_VL_8B_INSTRUCT>"
 DEFAULT_CHECKPOINT = "./outputs/rld_stage2/model"
 DEFAULT_DATA_FILE = "./data/erqa/erqa_test.jsonl"
 DEFAULT_DATA_ROOT = "./data/erqa"
