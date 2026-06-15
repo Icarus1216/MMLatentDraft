@@ -58,17 +58,20 @@ base VLM.
 
 ### Training Objectives
 
-| Loss                       | Role                  | Description                                                                                                          |
-| :------------------------- | :-------------------- | :------------------------------------------------------------------------------------------------------------------- |
-| **CE Loss**                | Main loss             | Standard next-token prediction. Thought positions are masked out (`labels=-100`).                                    |
-| **SW-SRS Loss**            | Latent supervision    | Stage-Windowed Self-Refined Supervision: each thought step is supervised against the *next* stage's key-token prior. |
-| **Exit-Token Loss**        | Exit signal           | Last latent step's hidden state, passed through a *frozen* `lm_head`, must predict `<|/latent|>`.                    |
-| **Visual-Probe Loss**      | Modality preservation | Ensures thought hidden states keep enough visual information.                                                        |
-| **Anti-Collapse (opt-in)** | Geometry guard        | Optional margin term that prevents latent steps from collapsing onto the exit-token direction.                       |
+The trainer optimises the sum of three losses (all other terms in the YAML
+configs - `exit_margin_*`, `swsrs_anti_collapse_*`, `diversity_*` - are kept
+at weight 0 in the released configs and are deprecated):
 
-> `lm_head` is **frozen on the SW-SRS / Exit-Token paths** (`detach`), so only
-> hidden states receive that gradient. The CE path keeps `lm_head` trainable
-> so the new special tokens can learn proper output rows.
+| Loss                         | Role                  | Description |
+| :--------------------------- | :-------------------- | :---------- |
+| **CE Loss**                  | Main loss             | Standard next-token prediction on the answer segment. Latent / thought positions are masked out (`labels=-100`). |
+| **Staged-DWAL Loss**         | Latent supervision    | Distribution-Weighted Anchor Loss applied *per latent step*. At each step `s` the trainer picks a stage-specific key-token subset `W_s` (`stage_key_token_ids[s]`); the **student** uses the full-vocab `log_softmax`, the **teacher** uses the same logits restricted to `W_s` with `softmax` + stop-gradient, and the loss is the resulting weighted-CE - strictly aligned with the Laser official `forward_dwal.py`. Controlled by `key_token_weight` and `loss_mode='laser_dwal'`. |
+| **Transition-Modality Loss** | Cross-modal anchoring | A geometric loss on each thought hidden state. Two reference centroids `v_bar` (vision) and `t_bar` (text) are computed from the prefix; a stage-conditioned slerp target `r = slerp(v_bar, t_bar; alpha)` is built (`alpha = 0.75` for *abstract* stages, `0.5` for *bridge* / *unified* stages). The hidden state is required to be **closer to `r` than to either `v_bar` or `t_bar`**, i.e. to lie inside the transition cone between the two modality directions. Implemented in `rld/visual_anchor.py`, gated by `vision_loss_weight` (local) x `vision_loss_total_weight` (top-level). |
+
+> `lm_head` is **frozen on the Staged-DWAL path** (`detach`), so the loss only
+> propagates into the hidden states / Thinker. The CE path keeps `lm_head`
+> trainable so the new special tokens (`<|latent|>` / `<|/latent|>`) can learn
+> proper output rows.
 
 ---
 
@@ -82,12 +85,12 @@ MMLatentDraft/
 │   ├── data.py                       #   Dataset + collator (multi-image, mixed modalities)
 │   ├── trainer_nld.py                #   NLDTrainer (dual lr, FSDP-friendly monitoring)
 │   ├── inference_utils.py            #   Greedy / beam / visualisation helpers
-│   ├── visual_anchor.py              #   Visual probe / anchor utilities
+│   ├── visual_anchor.py              #   Transition-modality (slerp) anchor utilities
 │   └── __init__.py
 │
 ├── configs/
 │   ├── fsdp_config.json                              # FSDP full_shard policy
-│   ├── rld_stage2_swsrs_v6b1b2b3_ckpt200.yaml        # Stage-2 SW-SRS on v6 b1+b2+b3 (19 195 samples)
+│   ├── rld_stage2_swsrs_v6b1b2b3_ckpt200.yaml        # Stage-2 Staged-DWAL on v6 b1+b2+b3 (19 195 samples; legacy filename keeps the swsrs prefix)
 │   ├── rld_stage2_erqa_vsibench_ckpt1200.yaml        # Continual training on ERQA + VSI-Bench
 │   ├── rld_stage2_erqa_vsibench_ckpt49_balanced.yaml
 │   └── rld_stage2_erqa_latent_cot_v2_ckpt49_balanced_v2.yaml
@@ -251,9 +254,11 @@ Training is FSDP-based (`full_shard auto_wrap`) and uses HuggingFace Trainer
 with a custom `NLDTrainer` (dual learning rate for VLM vs Thinker, plus extra
 monitoring). All launchers default to **8 GPUs** with `torchrun`.
 
-### Stage-2 SW-SRS on v6 b1+b2+b3 (19 195 samples)
+### Stage-2 Staged-DWAL on v6 b1+b2+b3 (19 195 samples)
 
-Trains from a Stage-1 checkpoint with SW-SRS loss to refine hidden geometry.
+Trains from a Stage-1 checkpoint with the Staged-DWAL + Transition-Modality
+losses to refine hidden geometry. (The yaml file name still carries a `swsrs`
+prefix for historical reasons; only the loss code path matters.)
 
 ```bash
 bash start_training_stage2_v6b1b2b3_ckpt200.sh
