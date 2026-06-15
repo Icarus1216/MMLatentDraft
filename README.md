@@ -6,17 +6,14 @@
 > space* of a Vision-Language Model. No external draft module, no auxiliary
 > decoder; the same Transformer that does autoregressive generation also does
 > latent thinking, by re-feeding its own last-layer hidden state through itself
-> as an RNN cell. Training and inference share **exactly** the same forward
-> path.
+> as an RNN cell.
 
 <p align="center">
   <a href="#-method"><b>Method</b></a> ·
   <a href="#-repository-layout"><b>Repository Layout</b></a> ·
   <a href="#-installation"><b>Installation</b></a> ·
-  <a href="#-data-synthesis"><b>Data Synthesis</b></a> ·
-  <a href="#-training"><b>Training</b></a> ·
-  <a href="#-evaluation"><b>Evaluation</b></a> ·
-  <a href="#-analysis"><b>Analysis</b></a>
+  <a href="#-inference"><b>Inference</b></a> ·
+  <a href="#-special-tokens"><b>Special Tokens</b></a>
 </p>
 
 ---
@@ -52,26 +49,6 @@ base VLM.
 - **Adaptive exit.** A latent step can exit either by predicting the
   `<|/latent|>` exit token *or* by a saturation signal on the hidden state
   (double safeguard).
-- **Train / inference parity.** No teacher-forcing tricks: the same
-  segment-wise forward (with KV-cache rebuild at boundaries) is used in both
-  modes.
-
-### Training Objectives
-
-The trainer optimises the sum of three losses (all other terms in the YAML
-configs - `exit_margin_*`, `swsrs_anti_collapse_*`, `diversity_*` - are kept
-at weight 0 in the released configs and are deprecated):
-
-| Loss                         | Role                  | Description |
-| :--------------------------- | :-------------------- | :---------- |
-| **CE Loss**                  | Main loss             | Standard next-token prediction on the answer segment. Latent / thought positions are masked out (`labels=-100`). |
-| **Staged-DWAL Loss**         | Latent supervision    | Distribution-Weighted Anchor Loss applied *per latent step*. At each step `s` the trainer picks a stage-specific key-token subset `W_s` (`stage_key_token_ids[s]`); the **student** uses the full-vocab `log_softmax`, the **teacher** uses the same logits restricted to `W_s` with `softmax` + stop-gradient, and the loss is the resulting weighted-CE - strictly aligned with the Laser official `forward_dwal.py`. Controlled by `key_token_weight` and `loss_mode='laser_dwal'`. |
-| **Transition-Modality Loss** | Cross-modal anchoring | A geometric loss on each thought hidden state. Two reference centroids `v_bar` (vision) and `t_bar` (text) are computed from the prefix; a stage-conditioned slerp target `r = slerp(v_bar, t_bar; alpha)` is built (`alpha = 0.75` for *abstract* stages, `0.5` for *bridge* / *unified* stages). The hidden state is required to be **closer to `r` than to either `v_bar` or `t_bar`**, i.e. to lie inside the transition cone between the two modality directions. Implemented in `rld/visual_anchor.py`, gated by `vision_loss_weight` (local) x `vision_loss_total_weight` (top-level). |
-
-> `lm_head` is **frozen on the Staged-DWAL path** (`detach`), so the loss only
-> propagates into the hidden states / Thinker. The CE path keeps `lm_head`
-> trainable so the new special tokens (`<|latent|>` / `<|/latent|>`) can learn
-> proper output rows.
 
 ---
 
@@ -83,66 +60,32 @@ MMLatentDraft/
 │   ├── model_v2.py                   #   NLDModelForVL — main model, segment-wise forward
 │   ├── latent_thinker.py             #   NativeLatentThinker — recurrent latent step
 │   ├── data.py                       #   Dataset + collator (multi-image, mixed modalities)
-│   ├── trainer_nld.py                #   NLDTrainer (dual lr, FSDP-friendly monitoring)
+│   ├── trainer_nld.py                #   Custom Trainer
 │   ├── inference_utils.py            #   Greedy / beam / visualisation helpers
 │   ├── visual_anchor.py              #   Transition-modality (slerp) anchor utilities
 │   └── __init__.py
 │
-├── configs/
-│   ├── fsdp_config.json                              # FSDP full_shard policy
-│   ├── rld_stage2_swsrs_v6b1b2b3_ckpt200.yaml        # Stage-2 Staged-DWAL on v6 b1+b2+b3 (19 195 samples; legacy filename keeps the swsrs prefix)
-│   ├── rld_stage2_erqa_vsibench_ckpt1200.yaml        # Continual training on ERQA + VSI-Bench
-│   ├── rld_stage2_erqa_vsibench_ckpt49_balanced.yaml
-│   └── rld_stage2_erqa_latent_cot_v2_ckpt49_balanced_v2.yaml
+├── configs/                          # Run configs (yaml)
+├── scripts/                          # Standalone scripts
+│   ├── inference.py                  #   Single-sample / batch inference
+│   ├── prepare_benchmark.py          #   Generic benchmark prep
+│   ├── prepare_vsibench.py           #   VSI-Bench prep (multi-image)
+│   └── download_benchmarks.py        #   Download MMStar / RealWorldQA / BLINK / MUIR / MMBench / …
 │
-├── scripts/
-│   ├── train_nld.py                  # Training entry (torchrun + FSDP)
-│   ├── inference.py                  # Single-sample / batch inference
-│   ├── prepare_benchmark.py          # Generic benchmark prep
-│   ├── prepare_vsibench.py           # VSI-Bench prep (multi-image)
-│   ├── download_benchmarks.py        # Download MMStar / RealWorldQA / BLINK / MUIR / MMBench / …
-│   ├── generate_erqa_latent_cot.py   # ERQA → latent-CoT data
-│   ├── generate_vsibench_latent_cot.py
-│   ├── merge_erqa_vsibench.py        # Mix ERQA + VSI-Bench training set
-│   ├── analyze_latent_distribution.py
-│   ├── plot_train_curves.py
-│   │
-│   ├── v3/ichat_client.py            # Generic OpenAI-compatible LLM client (used by v5/v6)
-│   ├── v5/                           # Latent-CoT data synthesis  v5 (single-stage prompt)
-│   │   ├── generate_v5.py
-│   │   ├── action_space.py
-│   │   ├── schema_v5.py
-│   │   └── prompts/
-│   └── v6/                           # Latent-CoT data synthesis  v6 (multi-source seeds + visual scanpath)
-│       ├── generate_v6.py
-│       ├── build_multi_source_seeds.py
-│       ├── regen_stage_tokens_visual_scanpath.py
-│       ├── schema_v6.py
-│       └── prompts/
-│
-├── eval_erqa.py                      # ERQA evaluator (LatentDraft model)
+├── eval_erqa.py                      # ERQA evaluator
 ├── prepare_erqa.py                   # ERQA preprocessing
 ├── prepare_vsibench.sh
-├── analyze_efficiency.py             # FLOPs / latency comparison: NLD vs CoT-Thinking
+│
+├── analyze_efficiency.py             # FLOPs / latency comparison vs CoT baseline
 ├── analyze_entropy_trigger.py        # Entropy at latent-trigger positions
-├── plot_efficiency_acl.py            # ACL-style efficiency figures
+├── plot_efficiency_acl.py            # Efficiency figures
 │
-├── modality_analysis/                # Hidden-state geometry analysis (Stage-1)
-│   └── scripts/                      #   anisotropy, native vs latent pairing, task specificity
+├── modality_analysis/                # Hidden-state geometry analysis
+├── modality_manifold_analysis/       # Modality-manifold analysis (CKA / t-SNE / cone evolution)
+├── paper_tables_figures/             # LaTeX tables / generation scripts
 │
-├── modality_manifold_analysis/       # Modality-manifold analysis (paper main figures)
-│   └── scripts/                      #   CKA / t-SNE / cone evolution / orthogonal decomposition
-│
-├── tools/viz_training_progress.py    # Training-curve dashboard
-├── paper_tables_figures/             # LaTeX tables / generation scripts (figures git-ignored)
-│
-├── start_training_stage2_v6b1b2b3_ckpt200.sh        # Launchers (8-GPU torchrun + FSDP)
-├── start_training_stage2_erqa_vsibench.sh
-├── start_inference.sh
-├── start_eval_erqa.sh
-├── start_generate_erqa_latent.sh
-├── start_generate_vsibench_latent.sh
-├── start_analyze_entropy_trigger.sh
+├── start_inference.sh                # Inference launcher
+├── start_eval_erqa.sh                # ERQA evaluation launcher
 ├── run_efficiency_analysis.sh
 ├── run_entropy_analysis.sh
 │
@@ -151,9 +94,9 @@ MMLatentDraft/
 └── README.md
 ```
 
-> Heavy artefacts (`data/`, `outputs/`, model weights, paper figures, training
-> logs) are excluded from the repository via `.gitignore`. Only the code path
-> is tracked.
+> Heavy artefacts (`data/`, `outputs/`, model weights, paper figures, logs)
+> are excluded from the repository via `.gitignore`. Only the code path is
+> tracked.
 
 ---
 
@@ -163,7 +106,6 @@ MMLatentDraft/
 
 - Python ≥ 3.10
 - PyTorch ≥ 2.1 with CUDA 12.x
-- 8 × GPU with ≥ 40 GB VRAM (training); 1 × GPU works for inference / analysis
 - Flash-Attention 2
 
 ### Setup
@@ -189,167 +131,18 @@ honour it) or replace the placeholder in your local config.
 
 ---
 
-## 🧪 Data Synthesis
-
-NLD is trained on **latent-CoT** data: each example carries a natural-language
-reasoning trace segmented by `<|pause|>` markers, plus per-stage *key tokens*
-that supervise the latent steps.
-
-### Synthesis pipelines
-
-| Pipeline   | Entry point                                | Notes                                                                            |
-| :--------- | :----------------------------------------- | :------------------------------------------------------------------------------- |
-| **v5**     | `scripts/v5/generate_v5.py`                | Single-stage prompt; action-space defined in `scripts/v5/action_space.py`.       |
-| **v6**     | `scripts/v6/generate_v6.py`                | Multi-source seeds + visual-scanpath stage tokens. Best quality for spatial QA.  |
-| ERQA       | `scripts/generate_erqa_latent_cot.py`      | ERQA-specific latent-CoT generation.                                             |
-| VSI-Bench  | `scripts/generate_vsibench_latent_cot.py`  | VSI-Bench-specific (multi-frame) latent-CoT generation.                          |
-
-The synthesisers share an OpenAI-compatible client (`scripts/v3/ichat_client.py`),
-so any model exposing the OpenAI Chat-Completion API (incl. self-hosted
-endpoints) can be used. Configure via env vars:
-
-```bash
-export OPENAI_API_KEY=<your_key>
-export OPENAI_BASE_URL=<your_endpoint>
-```
-
-### Quick start
-
-```bash
-# v6 — multi-source seeds (recommended)
-python scripts/v6/build_multi_source_seeds.py
-python scripts/v6/generate_v6.py --num_workers 32
-
-# ERQA / VSI-Bench latent-CoT data
-bash start_generate_erqa_latent.sh
-bash start_generate_vsibench_latent.sh
-```
-
-### Sample format
-
-```json
-{
-  "image_path": "data/erqa/images/xxx.png",
-  "question": "Which object is closest to the cup?",
-  "answer": "The book.",
-  "reasoning_for_training": "Stage 1: locate the cup … <|pause|> Stage 2: scan nearby objects … <|pause|> Stage 3: compare distances …",
-  "num_stages": 3,
-  "latent_key_tokens": [
-    {"stage": "Stage 1", "tokens": ["cup", "table", "left"]},
-    {"stage": "Stage 2", "tokens": ["book", "lamp", "phone"]}
-  ],
-  "task_type": "spatial_relation"
-}
-```
-
-At training time, every `<|pause|>` is rewritten to `<|latent|> <|/latent|>`
-and the model learns to emit those boundary tokens; all reasoning *between*
-the boundary tokens happens in hidden space.
-
----
-
-## 🚀 Training
-
-Training is FSDP-based (`full_shard auto_wrap`) and uses HuggingFace Trainer
-with a custom `NLDTrainer` (dual learning rate for VLM vs Thinker, plus extra
-monitoring). All launchers default to **8 GPUs** with `torchrun`.
-
-### Stage-2 Staged-DWAL on v6 b1+b2+b3 (19 195 samples)
-
-Trains from a Stage-1 checkpoint with the Staged-DWAL + Transition-Modality
-losses to refine hidden geometry. (The yaml file name still carries a `swsrs`
-prefix for historical reasons; only the loss code path matters.)
-
-```bash
-bash start_training_stage2_v6b1b2b3_ckpt200.sh
-# overrides
-bash start_training_stage2_v6b1b2b3_ckpt200.sh --gpus 4
-bash start_training_stage2_v6b1b2b3_ckpt200.sh --config /path/to/your.yaml
-```
-
-### Continual training on ERQA + VSI-Bench
-
-```bash
-bash start_training_stage2_erqa_vsibench.sh
-```
-
-### Common environment variables
-
-```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export PYTORCH_ALLOC_CONF=expandable_segments:True
-export NCCL_TIMEOUT=3600
-export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=3600
-```
-
-### Default hyper-parameters (Stage-2)
-
-| Parameter             | Value                          | Notes                                |
-| :-------------------- | :----------------------------- | :----------------------------------- |
-| Base model            | Qwen3-VL-8B-Instruct           | 8.3 B params, 36 layers, dim 4 096   |
-| Effective batch size  | 32                             | 1 × 4 grad-accum × 8 GPUs            |
-| LR (VLM)              | 2e-5                           | cosine schedule                      |
-| LR (Thinker)          | 1e-4                           | trained from scratch                 |
-| Max latent steps      | 8 (training) / 5 (inference)   | covers > 99 % of stage distribution   |
-| Sharding              | FSDP `full_shard auto_wrap`    | DeepSpeed disabled to avoid KV-cache  |
-| Precision             | bf16 + Flash-Attention 2       |                                       |
-
----
-
-## 📊 Evaluation
-
-### ERQA
-
-```bash
-bash start_eval_erqa.sh \
-    --checkpoint outputs/<your_run>/checkpoint-XXXX \
-    --model_path "$MODEL_PATH"
-```
-
-Outputs raw predictions, per-category accuracy, and an `erqa_eval_results.json`
-under `outputs/<your_run>_eval/`.
-
-### VSI-Bench / multi-bench
-
-```bash
-bash prepare_vsibench.sh
-python scripts/prepare_benchmark.py --bench MMStar RealWorldQA BLINK ...
-```
-
-Then plug the resulting json paths into your eval driver of choice.
-
-### Inference
+## 🚀 Inference
 
 ```bash
 bash start_inference.sh \
-    --checkpoint outputs/<your_run>/checkpoint-XXXX \
+    --checkpoint /path/to/checkpoint \
     --image path/to/image.jpg \
     --question "Your question here?"
 ```
 
----
-
-## 🔬 Analysis
-
-The repository ships several stand-alone analysis tools that produced the
-paper's tables and figures:
-
-| Script                                   | What it measures                                                              |
-| :--------------------------------------- | :---------------------------------------------------------------------------- |
-| `analyze_efficiency.py`                  | FLOPs and wall-clock latency vs Qwen3-VL-Thinking (CoT baseline) on ERQA.     |
-| `analyze_entropy_trigger.py`             | Per-token entropy at the positions where the model triggers `<|latent|>`.    |
-| `scripts/analyze_latent_distribution.py` | Distribution of #latent steps and trigger positions in the training set.     |
-| `modality_analysis/scripts/*`            | Stage-1 hidden-state geometry: anisotropy, native ↔ latent pairing.           |
-| `modality_manifold_analysis/scripts/*`   | Modality manifold: CKA trajectories, t-SNE, cone evolution, orthogonal decomp.|
-| `tools/viz_training_progress.py`         | Live dashboard of loss / monitor metrics during training.                     |
-
-```bash
-bash run_efficiency_analysis.sh \
-    --checkpoint outputs/<your_run>/checkpoint-XXXX
-
-bash run_entropy_analysis.sh \
-    --checkpoint outputs/<your_run>/checkpoint-XXXX
-```
+For benchmark-level evaluation see `start_eval_erqa.sh`,
+`scripts/prepare_benchmark.py` and the analysis launchers
+(`run_efficiency_analysis.sh`, `run_entropy_analysis.sh`).
 
 ---
 
