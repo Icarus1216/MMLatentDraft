@@ -67,13 +67,9 @@ MMLatentDraft/
 │
 ├── configs/                          # Run configs (yaml)
 ├── scripts/                          # Standalone scripts
-│   ├── inference.py                  #   Single-sample / batch inference
-│   ├── prepare_benchmark.py          #   Generic benchmark prep
-│   ├── prepare_vsibench.py           #   VSI-Bench prep (multi-image)
-│   └── download_benchmarks.py        #   Download MMStar / RealWorldQA / BLINK / MUIR / MMBench / …
-│
-├── prepare_erqa.py                   # ERQA preprocessing
-├── prepare_vsibench.sh
+│   ├── train_nld.py                  #   Training entry (torchrun + FSDP)
+│   ├── run_train_nld.sh              #   Generic training launcher
+│   └── inference.py                  #   Single-sample / batch inference
 │
 ├── analyze_efficiency.py             # FLOPs / latency comparison vs CoT baseline
 ├── analyze_entropy_trigger.py        # Entropy at latent-trigger positions
@@ -83,7 +79,8 @@ MMLatentDraft/
 ├── modality_manifold_analysis/       # Modality-manifold analysis (CKA / t-SNE / cone evolution)
 ├── paper_tables_figures/             # LaTeX tables / generation scripts
 │
-├── start_inference.sh                # Inference launcher
+├── start_training_stage2_v6b1b2b3_ckpt200.sh  # Training launcher (8-GPU FSDP)
+├── start_inference.sh                         # Inference launcher
 ├── run_efficiency_analysis.sh
 ├── run_entropy_analysis.sh
 │
@@ -138,9 +135,10 @@ bash start_inference.sh \
     --question "Your question here?"
 ```
 
-For benchmark preparation and analysis see `scripts/prepare_benchmark.py`
-and the analysis launchers (`run_efficiency_analysis.sh`,
-`run_entropy_analysis.sh`).
+For analysis utilities (efficiency / entropy / hidden-state geometry),
+see the analysis launchers (`run_efficiency_analysis.sh`,
+`run_entropy_analysis.sh`) and the `modality_analysis/` /
+`modality_manifold_analysis/` script directories.
 
 ---
 

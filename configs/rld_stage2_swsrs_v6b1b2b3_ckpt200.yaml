@@ -1,37 +1,17 @@
 # ============================================================
-#  RLD Stage-2 SW-SRS · v6 b1+b2+b3 · ckpt-200 起点 训练配置
+#  NLD Stage-2 training config (generic template)
 #  ----------------------------------------------------------
-#  目标:
-#    - 从 outputs/rld_stage2/checkpoint-200 的模型权重作为"预训练起点", 切到
-#      SW-SRS (Stage-Windowed Self-Refined Supervision) loss + 3 层 anti-collapse
-#      修复, 在 v6 b1+b2+b3 修复后的 19195 样本数据上精修 hidden 几何.
-#    - Trainer 的 step / optimizer / scheduler 全部从 0 开始 (走 model-only resume).
-#
-#  数据:
-#    data/v6/v6_b1b2b3_merged_training_slim_vsp_fixed.json  (19195 samples)
-#    - 由 scripts/v6/fix_slim_alignment_b1b2b3.py 重新生成
-#    - 修复了老 regen 脚本中 slim 与 src 按 image_path dict-key 错配的 bug,
-#      pause/boundary 严格 1:1 对齐 (alignment_rate = 100.00%, 之前 81.95%)
-#    - schema: image_path / question / answer / reasoning_for_training /
-#              latent_key_tokens (per-boundary nested) / task_type
-#    - boundary 数分布: 2(35%) / 3(41%) / 4(17%) / 5(7%)
-#    - stage role: abstract 42643 / concrete 42643 / unified 13984 / bridge 6448
-#
-#  起点 (resume_from_model_only):
-#    outputs/rld_stage2/checkpoint-200
-#    - 之前 stage2 训练阶段产物, embed shape=151671
-#    - 当前代码 embed shape=151936, 走 train_nld.py 的 shape 适配
-#      (前 151671 行用 ckpt, 后 265 行保留 Qwen 预留槽位; <|latent|> id=151669,
-#       <|/latent|> id=151670, 都落入前 151671 行 ✅)
-#    - HF Trainer 原生 resume 因 visual_alignment.* 已删除导致 strict load 失败,
-#      因此用 model-only resume, optimizer/scheduler/step 全新开始
+#  This file keeps all hyper-parameters that worked in our
+#  experiments but does NOT bind to any specific dataset or
+#  resume checkpoint. Replace the <PATH_TO_*> placeholders
+#  before running.
 # ============================================================
 
 # ============================================================
-# 基座模型
+# Base model
 # ============================================================
 model:
-  model_path: "<PATH_TO_QWEN3_VL_8B_INSTRUCT>"
+  model_path: "<PATH_TO_QWEN3_VL_8B_INSTRUCT>"  # e.g. /path/to/Qwen3-VL-8B-Instruct
   hidden_size: 4096
   total_layers: 36
   torch_dtype: "bfloat16"
@@ -41,124 +21,93 @@ model:
 # NativeLatentThinker
 # ============================================================
 nld:
-  # 推理时最大步数. 训练时步数由每个 boundary 的 stage 数决定.
-  # boundary 内 stage 数 ∈ {1, 2, 3} (unified / abstract+concrete /
-  # abstract+bridge+concrete), 每个样本 boundary 数 ≤ 5, 取 8 留 buffer
+  # Max latent steps at inference. During training the number of steps per
+  # boundary is determined by the data (#stages per boundary).
   max_think_steps: 8
 
-  # Think layers 范围 (覆盖全部 36 层)
+  # Think layers range (covers all 36 layers)
   think_layer_start: 0
   think_layer_end: 36
 
-  # 推理饱和退出阈值
+  # Saturation-based early-exit threshold at inference.
   saturation_exit_threshold: 0.99
 
-  # SW-SRS loss 权重
+  # Staged-DWAL loss weight (key-token weighted CE on latent steps).
   key_token_weight: 1.0
 
-  # ============================================================
-  # 3 层 Anti-Collapse 修复 (DISABLED 本次实验)
-  # ----------------------------------------------------------
-  # ⚠️ 本次实验暂时全部关闭 (local_w / top_w 双置 0):
-  #    实验目的: 切到 path B2 视觉侧 vision_loss (过渡模态几何约束) 单独驱动
-  #    hidden 几何, 观察其在缺少 anti-collapse 兜底时是否能维持稳定. SLERP
-  #    把 hidden 拉向视觉锥与文本锥之间的过渡邻域, 本身具备反塌缩效果;
-  #    若 vision_loss 单独不够用, 再回开 ④⑤⑥ 中的部分子项.
-  # ============================================================
-  # Layer 1: Soft Anti-Premature-Exit  (DISABLED)
-  exit_margin: 2.0                        # 阈值保留 (诊断用)
-  exit_margin_weight: 0.0                 # ⛔ 关闭: latent_thinker 内部权重
-  exit_margin_loss_weight: 0.0            # ⛔ 关闭: model_v2 顶层权重
-
-  # Layer 2: SW-SRS Anti-Collapse  (DISABLED)
-  # sw_srs_alpha 仍保留 (它属于 DWAL 内部 hard-target 混合权重, 不属于 anti-collapse)
+  # ------------------------------------------------------------
+  # Anti-collapse regularizers (kept as 0 in released config —
+  # the slerp-based transition-modality loss already prevents
+  # collapse; flip these on if you observe degenerate hidden
+  # states in your own data.)
+  # ------------------------------------------------------------
+  exit_margin: 2.0
+  exit_margin_weight: 0.0
+  exit_margin_loss_weight: 0.0
   sw_srs_alpha: 0.7
-  swsrs_anti_collapse_margin: 0.5         # 阈值保留 (诊断用)
-  swsrs_anti_collapse_weight: 0.0         # ⛔ 关闭: latent_thinker 内部权重
-  swsrs_anti_collapse_loss_weight: 0.0    # ⛔ 关闭: model_v2 顶层权重
+  swsrs_anti_collapse_margin: 0.5
+  swsrs_anti_collapse_weight: 0.0
+  swsrs_anti_collapse_loss_weight: 0.0
+  diversity_threshold: 0.95
+  diversity_weight: 0.0
+  diversity_loss_weight: 0.0
 
-  # Layer 3: Stage-Diversity Regularizer  (DISABLED)
-  diversity_threshold: 0.95               # 阈值保留 (诊断用)
-  diversity_weight: 0.0                   # ⛔ 关闭: latent_thinker 内部权重
-  diversity_loss_weight: 0.0              # ⛔ 关闭: model_v2 顶层权重
+  # ------------------------------------------------------------
+  # Transition-modality (slerp) anchor loss
+  #   r = SLERP(v_bar, t_bar; alpha)
+  #     alpha = abstract:0.75 / bridge:0.5 / unified:0.5 / concrete:0.25
+  #   L = ReLU(cos(h, v_bar) - cos(h, r) + delta)
+  #     + ReLU(cos(h, t_bar) - cos(h, r) + delta)
+  # Requires a stage-role field on each latent step in the data.
+  # ------------------------------------------------------------
+  vision_loss_weight: 1.0
+  vision_loss_total_weight: 1.0
+  vision_top_k: 6
+  vision_margin: 0.05
 
-  # ============================================================
-  # path B2: 视觉侧 vision_loss (过渡模态几何约束)  ★ 本次实验主攻
-  # ----------------------------------------------------------
-  # 设计 (rld/visual_anchor.py):
-  #   1. v_bar: stage key tokens 的 mean embedding 当 query, 在视觉 token 上
-  #             做 cosine top-K 检索取均值 -> 视觉重心 (无可学参数).
-  #   2. t_bar: stage key tokens 的 LM input embedding 均值 -> 文本重心.
-  #   3. r = SLERP(v_bar, t_bar; alpha)  ← role-driven 过渡模态参考目标
-  #          alpha = abstract:0.75 / bridge:0.5 / unified:0.5 / concrete:0.25
-  #   4. 双 anchor margin loss:
-  #          L = ReLU(cos(h, v_bar) - cos(h, r) + δ)
-  #            + ReLU(cos(h, t_bar) - cos(h, r) + δ)
-  #          要求 hidden 比 v_bar / t_bar 都更靠近 r, 落进过渡邻域.
-  #
-  # 启用条件: 数据 schema 含 stage role 字段.
-  #   ✅ 当前数据 v6_b1b2b3_merged_training_slim_vsp_fixed.json 已具备:
-  #      abstract 42643 / concrete 42643 / unified 13984 / bridge 6448
-  #
-  # 起步权重: local × top = 1.0 × 1.0 = 1.0
-  #   - vision_loss 数值范围 ~[0, 0.2] (ReLU(cos差 + δ)), 量级远小于 CE/DWAL,
-  #     无需额外缩放; 若首 100 step 数值占比过高再下调.
-  # ============================================================
-  vision_loss_weight: 1.0                 # ✅ latent_thinker 内部本地权重
-  vision_loss_total_weight: 1.0           # ✅ model_v2 顶层权重
-  vision_top_k: 6                         # top-K 视觉 token 检索 (默认 6)
-  vision_margin: 0.05                     # 双 anchor margin 的 δ (默认 0.05)
-
-  # ⭐ 仅加载模型权重 (不走 HF Trainer 原生 resume)
-  resume_from_model_only: "./outputs/rld_stage2/checkpoint-200"
+  # Optional model-only resume from a previous Stage-1 checkpoint.
+  # Set to a directory containing model.safetensors, or leave blank
+  # to train from the base model.
+  resume_from_model_only: "<PATH_TO_STAGE1_CHECKPOINT>"
 
 # ============================================================
-# 数据 (v6 b1+b2+b3 fixed, 19195 samples)
+# Data
 # ============================================================
 data:
-  train_json: "./data/v6/v6_b1b2b3_merged_training_slim_vsp_fixed.json"
-  image_base_dir: ""
+  train_json: "<PATH_TO_TRAIN_JSON>"  # latent-CoT json (see README sample)
+  image_base_dir: "."
   skip_image_check: true
-  min_pixels: 3136             # 56x56 最小
-  max_pixels: 1048576          # 1024x1024 最大
+  min_pixels: 3136             # 56x56
+  max_pixels: 1048576          # 1024x1024
   max_seq_len: 8192
   use_system_prompt: true
 
 # ============================================================
-# 训练
+# Training
 # ============================================================
 training:
-  output_dir: "./outputs/rld_stage2_swsrs_v6b1b2b3_ckpt200"
+  output_dir: "./outputs/nld_stage2"
 
   # FSDP
   fsdp: "full_shard auto_wrap"
   fsdp_config: "configs/fsdp_config.json"
 
-  # 训练规模估算 (2 epochs):
-  #   19195 samples / (bs=1 * grad_accum=4 * 8 GPU) ≈ 600 effective steps/epoch
-  #   2 epochs ≈ 1200 steps (从 step 0 开始, 不续 ckpt-200 的 200 step)
   num_epochs: 2
   per_device_train_batch_size: 1
   per_device_eval_batch_size: 1
   gradient_accumulation_steps: 4
-  gradient_checkpointing: false   # 与 KV cache / 多次 forward 不兼容
+  gradient_checkpointing: false   # incompatible with KV cache + multi-forward
 
-  # 学习率 (沿用 swsrs_resume 已验证的稳定值)
   learning_rate: 5.0e-6
   thinker_lr: 2.0e-5
   vlm_lr: 5.0e-6
 
   weight_decay: 0.01
-  # 1200 step 总训练, warmup 50 step (≈ 4%)
   warmup_steps: 50
   lr_scheduler_type: "cosine"
   max_grad_norm: 0.5
 
-  # Logging / checkpoint
-  # save_steps=100 → 2 epochs ≈ 12 个检查点
   logging_steps: 20
-  # 2026-05-18 调整: 50 → 20 (每 ~32 分钟打印一次监控, 便于早期及时发现训练健康问题)
-  # 95s/step × 20 = ~32 min/打印, 1200 step 共打印 60 次, 不会污染日志
   monitor_every_n_steps: 20
   save_steps: 100
   save_total_limit: 8
@@ -167,6 +116,6 @@ training:
   report_to: ["tensorboard"]
 
 # ============================================================
-# 随机种子
+# Random seed
 # ============================================================
 seed: 42

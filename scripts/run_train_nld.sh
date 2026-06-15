@@ -23,7 +23,7 @@ export TOKENIZERS_PARALLELISM=false
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-CONFIG="${PROJECT_DIR}/configs/nld_train_phase1.yaml"
+CONFIG="${PROJECT_DIR}/configs/rld_stage2_swsrs_v6b1b2b3_ckpt200.yaml"
 NUM_GPUS=8
 MASTER_PORT=${MASTER_PORT:-29500}
 
@@ -69,17 +69,10 @@ if [ ! -f "${CONFIG}" ]; then
     exit 1
 fi
 
-# 检查训练数据
+# Train data path (from YAML); existence is verified by the trainer itself.
 TRAIN_JSON=$(python3 -c "import yaml; print(yaml.safe_load(open('${CONFIG}'))['data']['train_json'])")
-if [ -f "${TRAIN_JSON}" ]; then
-    NUM_SAMPLES=$(python3 -c "import json; print(len(json.load(open('${TRAIN_JSON}'))))")
-    echo ""
-    echo "  训练数据:     ${TRAIN_JSON}"
-    echo "  样本数:       ${NUM_SAMPLES}"
-else
-    echo "❌ 训练数据不存在: ${TRAIN_JSON}"
-    exit 1
-fi
+echo ""
+echo "  Train data:   ${TRAIN_JSON}"
 
 echo ""
 echo "============================================================"
