@@ -72,7 +72,6 @@ MMLatentDraft/
 │   ├── prepare_vsibench.py           #   VSI-Bench prep (multi-image)
 │   └── download_benchmarks.py        #   Download MMStar / RealWorldQA / BLINK / MUIR / MMBench / …
 │
-├── eval_erqa.py                      # ERQA evaluator
 ├── prepare_erqa.py                   # ERQA preprocessing
 ├── prepare_vsibench.sh
 │
@@ -85,7 +84,6 @@ MMLatentDraft/
 ├── paper_tables_figures/             # LaTeX tables / generation scripts
 │
 ├── start_inference.sh                # Inference launcher
-├── start_eval_erqa.sh                # ERQA evaluation launcher
 ├── run_efficiency_analysis.sh
 ├── run_entropy_analysis.sh
 │
@@ -140,9 +138,9 @@ bash start_inference.sh \
     --question "Your question here?"
 ```
 
-For benchmark-level evaluation see `start_eval_erqa.sh`,
-`scripts/prepare_benchmark.py` and the analysis launchers
-(`run_efficiency_analysis.sh`, `run_entropy_analysis.sh`).
+For benchmark preparation and analysis see `scripts/prepare_benchmark.py`
+and the analysis launchers (`run_efficiency_analysis.sh`,
+`run_entropy_analysis.sh`).
 
 ---
 

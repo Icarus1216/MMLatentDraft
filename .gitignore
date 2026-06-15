@@ -95,3 +95,12 @@ modality_analysis/scripts/run_extract_embeddings.sh
 modality_analysis/scripts/run_extract_embeddings_ckpt1200.sh
 modality_manifold_analysis/scripts/run_manifold_with_generation.sh
 modality_manifold_analysis/scripts/run_manifold_analysis_with_docker.sh
+
+# 评测脚本 / 针对 ERQA / VSI-Bench 的训练脚本与配置 (不上传)
+eval_erqa.py
+start_eval_erqa.sh
+start_training_stage2_erqa_vsibench.sh
+configs/rld_stage2_erqa_vsibench_ckpt1200.yaml
+configs/rld_stage2_erqa_vsibench_ckpt49_balanced.yaml
+configs/rld_stage2_erqa_latent_cot_v2_ckpt49_balanced_v2.yaml
+scripts/merge_erqa_vsibench.py
