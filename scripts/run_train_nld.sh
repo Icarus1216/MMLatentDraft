@@ -23,7 +23,7 @@ export TOKENIZERS_PARALLELISM=false
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-CONFIG="${PROJECT_DIR}/configs/rld_stage2_swsrs_v6b1b2b3_ckpt200.yaml"
+CONFIG="${PROJECT_DIR}/configs/nld_train.yaml"
 NUM_GPUS=8
 MASTER_PORT=${MASTER_PORT:-29500}
 

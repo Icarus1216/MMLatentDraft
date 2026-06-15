@@ -27,9 +27,9 @@ FIGURES_DIR="${SCRIPT_DIR}/../figures"
 PART="${1:-all}"
 
 # 训练数据路径
-CKPT1200_STATE="${PROJ_ROOT}/outputs/rld_stage2_swsrs_v6b1b2b3_ckpt200/checkpoint-1200/trainer_state.json"
-CKPT900_STATE="${PROJ_ROOT}/outputs/rld_stage2_swsrs_v6b1b2b3_ckpt200/checkpoint-900/trainer_state.json"
-CKPT600_STATE="${PROJ_ROOT}/outputs/rld_stage2_swsrs_v6b1b2b3_ckpt200/checkpoint-600/trainer_state.json"
+CKPT1200_STATE="${PROJ_ROOT}/outputs/<RUN_NAME>/checkpoint-1200/trainer_state.json"
+CKPT900_STATE="${PROJ_ROOT}/outputs/<RUN_NAME>/checkpoint-900/trainer_state.json"
+CKPT600_STATE="${PROJ_ROOT}/outputs/<RUN_NAME>/checkpoint-600/trainer_state.json"
 
 # Baseline 模型路径 (Docker 内)
 BASELINE_MODEL="/workspace/LatentDraft/outputs/modality_geometry_v2"

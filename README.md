@@ -73,13 +73,13 @@ MMLatentDraft/
 │
 ├── analyze_efficiency.py             # FLOPs / latency comparison vs CoT baseline
 ├── analyze_entropy_trigger.py        # Entropy at latent-trigger positions
-├── plot_efficiency_acl.py            # Efficiency figures
+├── plot_efficiency.py                # Efficiency figures
 │
 ├── modality_analysis/                # Hidden-state geometry analysis
 ├── modality_manifold_analysis/       # Modality-manifold analysis (CKA / t-SNE / cone evolution)
 ├── paper_tables_figures/             # LaTeX tables / generation scripts
 │
-├── start_training_stage2_v6b1b2b3_ckpt200.sh  # Training launcher (8-GPU FSDP)
+├── start_training.sh                          # Training launcher (8-GPU FSDP)
 ├── start_inference.sh                         # Inference launcher
 ├── run_efficiency_analysis.sh
 ├── run_entropy_analysis.sh

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-重绘 Efficiency Comparison 图 (ACL style)
-用法: python plot_efficiency_acl.py
+Plot Efficiency Comparison figure (FLOPs / Latency / Tokens).
+Usage: python plot_efficiency.py
 """
 
 import os
 import json
 
-def plot_efficiency_acl(summary_stats_path, output_dir, dpi=300, latent_flops=None, latent_flops_rel_err=None):
+def plot_efficiency(summary_stats_path, output_dir, dpi=300, latent_flops=None, latent_flops_rel_err=None):
     try:
         import matplotlib.pyplot as plt
         import matplotlib
@@ -170,7 +170,7 @@ def plot_efficiency_acl(summary_stats_path, output_dir, dpi=300, latent_flops=No
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Plot efficiency comparison (ACL style)")
+    parser = argparse.ArgumentParser(description="Plot efficiency comparison")
     parser.add_argument("--summary", default="./outputs/efficiency_analysis/summary_stats.json",
                         help="Path to summary_stats.json")
     parser.add_argument("--out_dir", default="./paper_tables_figures",
@@ -183,5 +183,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    plot_efficiency_acl(args.summary, args.out_dir, dpi=args.dpi, latent_flops=args.latent_flops,
-                        latent_flops_rel_err=args.latent_flops_rel_err)
+    plot_efficiency(args.summary, args.out_dir, dpi=args.dpi, latent_flops=args.latent_flops,
+                    latent_flops_rel_err=args.latent_flops_rel_err)

@@ -62,7 +62,7 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 
 DEFAULT_CKPT_PATH = os.path.join(
     PROJ_ROOT,
-    'outputs/rld_stage2_swsrs_v6b1b2b3_ckpt200/checkpoint-1200/trainer_state.json'
+    'outputs/<RUN_NAME>/checkpoint-1200/trainer_state.json'
 )
 
 

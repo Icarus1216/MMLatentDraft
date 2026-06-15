@@ -342,7 +342,7 @@ def main():
         axes[j].axis("off")
 
     fig.suptitle(
-        f"Stage-2 (v6b1b2b3, ckpt200) training curves — last step = {last_step}",
+        f"Stage-2 training curves — last step = {last_step}",
         fontsize=13, y=1.0,
     )
     fig.tight_layout()

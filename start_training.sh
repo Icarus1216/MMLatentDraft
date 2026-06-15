@@ -9,9 +9,9 @@
 #    running, OR pass --config /path/to/your.yaml.
 #
 #  Usage:
-#    bash start_training_stage2_v6b1b2b3_ckpt200.sh
-#    bash start_training_stage2_v6b1b2b3_ckpt200.sh --gpus 4
-#    bash start_training_stage2_v6b1b2b3_ckpt200.sh --config /path/to/your.yaml
+#    bash start_training.sh
+#    bash start_training.sh --gpus 4
+#    bash start_training.sh --config /path/to/your.yaml
 # ============================================================
 
 set -e
@@ -25,7 +25,7 @@ export TOKENIZERS_PARALLELISM=false
 
 # ======================== Step 2: Paths ========================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG="${SCRIPT_DIR}/configs/rld_stage2_swsrs_v6b1b2b3_ckpt200.yaml"
+CONFIG="${SCRIPT_DIR}/configs/nld_train.yaml"
 NUM_GPUS=8
 MASTER_PORT=${MASTER_PORT:-29505}
 
