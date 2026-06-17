@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-visualize_modality_manifold.py (v2 — 精简版)
+visualize_modality_manifold.py
 ==============================
 "模态流形分析"可视化 —— 支撑 last_hidden_state 训练成"视觉-语言过渡模态"的 insight
-
-仅保留对分析和论证有效的指标，精简图表。
 
 Figure 1: 模态对齐轨迹 (Alignment Trajectory)
   - cos(H,V) / cos(H,T) 随训练步数的演化
@@ -30,7 +28,7 @@ Figure 6: 模态锥体 3D 演化 (3D Cone Evolution)
   - 训练前后 V/L/H 锥体相对位置变化
 
 Figure 7: 与 Baseline 对比 (Baseline Comparison)
-  - 训练前 (预训练模型) vs 训练后 (ckpt-1200) 的关键指标对比
+  - 训练前 (预训练模型) vs 训练后的关键指标对比
 
 用法:
   python3 visualize_modality_manifold.py
@@ -163,7 +161,7 @@ def add_phase_backgrounds(ax, phases, alpha=0.08):
 
 
 # ============================================================
-# Figure 1: 模态对齐轨迹 (精简版)
+# Figure 1: 模态对齐轨迹 
 # ============================================================
 def plot_alignment_trajectory(data, phases, out_dir):
     """cos(H,V) / cos(H,T) 随训练步数的演化"""
@@ -336,7 +334,7 @@ def plot_transition_index(data, phases, baseline, out_dir):
 
 
 # ============================================================
-# Figure 3: 隐状态几何演化 (精简版)
+# Figure 3: 隐状态几何演化
 # ============================================================
 def plot_hidden_geometry(data, phases, out_dir):
     """diag_score / h_norm / shift_kl / adj_cos"""
@@ -464,7 +462,7 @@ def plot_cka_trajectory(data, phases, out_dir):
 
 
 # ============================================================
-# Figure 5: 训练阶段仪表盘 (精简版 6 面板)
+# Figure 5: 训练阶段仪表盘
 # ============================================================
 def plot_training_dashboard(data, phases, out_dir):
     """综合仪表盘 — 6 面板"""
@@ -675,7 +673,7 @@ def plot_3d_cone_evolution(data, phases, baseline, out_dir):
             ax.quiver(0, 0, 0, center_dir[0], center_dir[1], center_dir[2],
                      color=color, arrow_length_ratio=0.15, lw=2.5, label=label)
 
-            # 画锥面 (简化为几条射线)
+            # 画锥面
             cone_rad = np.radians(cone_angle)
             perp1 = np.cross(center_dir, [0, 0, 1])
             if np.linalg.norm(perp1) < 1e-6:
